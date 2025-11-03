@@ -1174,6 +1174,7 @@ class WanAttentionBlock(nn.Module):
         B, N, C = x.shape
         T = num_latent_frames
         is_longcat = C == 4096
+        x_ip_out = x_ip
         if is_longcat:
             input_x = self.modulate(self.norm1(x.view(B, T, -1, C).to(shift_msa.dtype)), shift_msa, scale_msa, seg_idx=self.seg_idx).to(input_dtype).view(B, N, C)
         else:
@@ -1341,6 +1342,7 @@ class WanAttentionBlock(nn.Module):
                 y[:, : -self.cond_size],
                 y[:, -self.cond_size :],
             )
+            x_ip_out = y_ip
 
         # S2V
         if zero_timestep: 
@@ -1381,7 +1383,7 @@ class WanAttentionBlock(nn.Module):
                 if nag_context is not None:
                     raise NotImplementedError("nag_context is not supported in split_cross_attn_ffn")
                 x = self.split_cross_attn_ffn(x, context, shift_mlp, scale_mlp, gate_mlp, clip_embed, grid_sizes)
-                return x, x_ip, lynx_ref_feature, x_ovi
+                return x, x_ip_out, lynx_ref_feature, x_ovi
             else:
                 x = self.cross_attn_ffn(
                     x,
@@ -1539,7 +1541,7 @@ class WanAttentionBlock(nn.Module):
                 latent_steps = max(int(num_latent_steps), 1)
                 x = x + (x_ffn.view(x.shape[0], -1, latent_steps, x.shape[-1]).float() * gate_mlp).to(input_dtype).view(x.shape[0], -1, x.shape[-1])
 
-        return x
+        return x, x_ip_out, lynx_ref_feature, x_ovi
 
     @torch.compiler.disable()
 
