@@ -1423,7 +1423,9 @@ class WanAttentionBlock(nn.Module):
                     is_longcat=is_longcat,
                     num_latent_steps=T,
                 )
-    
+
+        return x, x_ip_out, lynx_ref_feature, x_ovi
+
     def cross_attn_ffn(
         self,
         x,
