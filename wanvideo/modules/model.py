@@ -1541,7 +1541,7 @@ class WanAttentionBlock(nn.Module):
                 latent_steps = max(int(num_latent_steps), 1)
                 x = x + (x_ffn.view(x.shape[0], -1, latent_steps, x.shape[-1]).float() * gate_mlp).to(input_dtype).view(x.shape[0], -1, x.shape[-1])
 
-        return x, x_ip_out, lynx_ref_feature, x_ovi
+        return x
 
     @torch.compiler.disable()
 
