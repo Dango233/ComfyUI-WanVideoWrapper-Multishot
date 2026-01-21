@@ -151,9 +151,9 @@
 ## 3. 具体重构 Checklist（可按步骤逐项验证）
 
 ### A. 新增 shot_utils 基础能力
-- [ ] 添加 `wanvideo/modules/shot_utils.py`（保持 main 内容）
-- [ ] `__init__.py` 中做 `sys.modules.setdefault` 兼容映射
-- [ ] `parse_structured_prompt()` 可处理 fast/slow tokenizer offsets
+- [x] 添加 `wanvideo/modules/shot_utils.py`（保持 main 内容）
+- [x] `__init__.py` 中做 `sys.modules.setdefault` 兼容映射
+- [x] `parse_structured_prompt()` 可处理 fast/slow tokenizer offsets
 
 **Diff 指向**：
 - `git diff 393fe78..main -- wanvideo/modules/shot_utils.py`
@@ -249,3 +249,4 @@
 
 ## 7. 实施记录
 - 2026-01-21 Commit 1：新增 `docs/multishot_refactor_plan.md`，删除旧文档 `docs/reimplement_main_since_upstream.md`（文档基线确立）。**Checklist 更新：** `Z. 文档与流程` 完成。
+- 2026-01-21 Commit 2：新增 `wanvideo/modules/shot_utils.py` 并在 `__init__.py` 建立 `wanvideo.modules.shot_utils` 映射。**Checklist 更新：** `A. 新增 shot_utils 基础能力` 完成。
