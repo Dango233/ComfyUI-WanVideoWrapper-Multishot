@@ -5,6 +5,7 @@ import hashlib
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
+from .wanvideo.modules.shot_utils import enforce_4t_plus_1, parse_shot_cut_string, parse_structured_prompt
 
 from comfy import model_management as mm
 from comfy.utils import ProgressBar, common_upscale
@@ -145,6 +146,309 @@ class WanVideoBlockList:
                         raise ValueError(f"Invalid integer: '{part}'")
         return (block_list,)
 
+
+
+class WanVideoHolocineShotArgs:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image_embeds": ("WANVIDIMAGE_EMBEDS", {"tooltip": "Image embeds produced by WanVideoEmptyEmbeds (or equivalent) for frame inference."}),
+                "shot_cut_frames": ("STRING", {"default": "40, 80", "tooltip": "Comma or space separated frame indices where a new shot begins."}),
+            }
+        }
+
+    RETURN_TYPES = ("HOLOCINE_SHOTARGS",)
+    RETURN_NAMES = ("holocine_args",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper/Holocine"
+
+    def process(self, image_embeds, shot_cut_frames):
+        inferred_frames = None
+        if isinstance(image_embeds, dict):
+            inferred_frames = image_embeds.get("num_frames")
+            if torch.is_tensor(inferred_frames):
+                inferred_frames = int(inferred_frames.item())
+            if inferred_frames is None:
+                target_shape = image_embeds.get("target_shape")
+                if target_shape is not None and len(target_shape) >= 2:
+                    latent_frames = target_shape[1]
+                    if torch.is_tensor(latent_frames):
+                        latent_frames = int(latent_frames.item())
+                    inferred_frames = 1 + (latent_frames - 1) * VAE_STRIDE[0]
+
+        if inferred_frames is None:
+            raise ValueError("Failed to infer frame count from image_embeds. Please connect WanVideoEmptyEmbeds or an equivalent output that provides num_frames.")
+
+        total_frames_proc = enforce_4t_plus_1(int(inferred_frames))
+        try:
+            raw_cuts = parse_shot_cut_string(shot_cut_frames)
+        except ValueError as exc:
+            raise ValueError(f"Failed to parse shot cut frames: {exc}") from exc
+
+        processed_cuts = []
+        for frame in raw_cuts:
+            frame_proc = enforce_4t_plus_1(frame)
+            if 0 < frame_proc < total_frames_proc:
+                processed_cuts.append(frame_proc)
+
+        return ({
+            "total_frames": total_frames_proc,
+            "shot_cut_frames": processed_cuts,
+        },)
+
+
+class WanVideoHolocineShotBuilder:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "shot_caption": ("STRING", {"default": "", "multiline": True, "tooltip": "镜头描述，会按添加顺序拼接。"}),
+            },
+            "optional": {
+                "shot_list": ("WANVID_HOLOCINE_SHOT_LIST",),
+                "shot_lora": ("WANVIDLORA", {"default": None, "tooltip": "可选：为当前镜头附加的 LoRA 列表，会在采样时按镜头聚合。"}),
+                "smooth_window": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 64,
+                    "step": 1,
+                    "tooltip": "共享给下一镜头的 token 数（0 表示关闭，常见范围 1-12）。"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("WANVID_HOLOCINE_SHOT_LIST",)
+    RETURN_NAMES = ("shot_list",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper/Holocine"
+    DESCRIPTION = "Build a Holocine-style structured shot list by chaining this node."
+
+    def process(self, shot_caption, shot_list=None, shot_lora=None, smooth_window=0):
+        caption = shot_caption.strip()
+        if not caption:
+            raise ValueError("Shot caption cannot be empty.")
+
+        shots = [] if shot_list is None else list(shot_list)
+        shot_index = len(shots)
+        shot_info = {
+            "index": shot_index,
+            "caption": caption,
+        }
+        if shot_lora is not None:
+            shot_info["lora"] = list(shot_lora)
+        try:
+            smooth_value = int(smooth_window)
+        except Exception:
+            smooth_value = 0
+        smooth_value = max(0, smooth_value)
+        shot_info["smooth_window"] = smooth_value
+        shots.append(shot_info)
+        return (shots,)
+
+
+class WanVideoHolocinePromptEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "global_caption": ("STRING", {"default": "", "multiline": True, "tooltip": "整体场景描述，会自动拼接到 [global caption] 段落。"}),
+                "shot_list": ("WANVID_HOLOCINE_SHOT_LIST",),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+                "t5": ("WANTEXTENCODER",),
+                "image_embeds": ("WANVIDIMAGE_EMBEDS", {"tooltip": "Image embeds produced by WanVideoEmptyEmbeds (or equivalent) for frame inference."}),
+            },
+            "optional": {
+                "custom_shot_cut_frames": ("STRING", {"default": "", "tooltip": "可选：自定义镜头切换帧，逗号/空格分隔。留空则按镜头数平均分配。"}),
+                "append_shot_summary": ("BOOLEAN", {"default": True, "tooltip": "自动在全局描述后追加 \"This scene contains N shots.\""}),
+                "force_offload": ("BOOLEAN", {"default": True}),
+                "model_to_offload": ("WANVIDEOMODEL", {"tooltip": "编码前临时卸载模型以释放显存"}),
+                "use_disk_cache": ("BOOLEAN", {"default": False, "tooltip": "启用磁盘缓存时可免加载 T5"}),
+                "device": (["gpu", "cpu"], {"default": "gpu"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDEOTEXTEMBEDS", "HOLOCINE_SHOTARGS", "STRING")
+    RETURN_NAMES = ("text_embeds", "holocine_args", "positive_prompt")
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper/Holocine"
+    DESCRIPTION = "Encode Holocine structured prompt into WANVIDEOTEXTEMBEDS and HOLOCINE_SHOTARGS for shot attention pipelines."
+
+    def _auto_shot_cuts(self, total_frames: int, shot_count: int) -> list[int]:
+        if shot_count <= 1:
+            return []
+        cuts = []
+        step = total_frames / shot_count
+        for i in range(1, shot_count):
+            approx = max(1, round(i * step))
+            enforced = enforce_4t_plus_1(approx)
+            if enforced >= total_frames:
+                enforced = total_frames - 4
+                enforced = enforce_4t_plus_1(enforced)
+            if enforced <= 0 or enforced >= total_frames:
+                continue
+            if enforced not in cuts:
+                cuts.append(enforced)
+        return cuts
+
+    def _compose_prompt(self, global_caption: str, shots: list[dict], append_summary: bool) -> str:
+        global_text = global_caption.strip()
+        if append_summary and shots:
+            summary = f" This scene contains {len(shots)} shots."
+            if "this scene contains" not in global_text.lower():
+                global_text = (global_text + summary).strip()
+
+        prompt = f"[global caption] {global_text}" if global_text else "[global caption]"
+
+        if shots:
+            shot_texts = [shot["caption"].strip() for shot in shots]
+            per_shot = " [shot cut] ".join(shot_texts)
+            prompt = f"{prompt} [per shot caption] {per_shot}"
+
+        return prompt.strip()
+
+    def process(self, global_caption, shot_list, negative_prompt, t5, image_embeds,
+                custom_shot_cut_frames="", append_shot_summary=True,
+                force_offload=True, model_to_offload=None, use_disk_cache=False, device="gpu"):
+        if not shot_list or len(shot_list) == 0:
+            raise ValueError("At least one shot is required. Please chain WanVideoHolocineShotBuilder nodes first.")
+
+        shots = sorted([dict(item) for item in shot_list], key=lambda s: s.get("index", 0))
+        shot_lora_config: list[list[dict]] = []
+        smooth_windows: list[int] = []
+        for shot in shots:
+            normalized_loras = []
+            loras_raw = shot.get("lora")
+            if loras_raw:
+                for entry in loras_raw:
+                    if isinstance(entry, dict):
+                        normalized_loras.append(dict(entry))
+            shot_lora_config.append(normalized_loras)
+            window_value = shot.get("smooth_window", 0)
+            try:
+                window_int = int(window_value)
+            except Exception:
+                window_int = 0
+            window_int = max(0, window_int)
+            smooth_windows.append(window_int)
+
+        inferred_frames = None
+        if isinstance(image_embeds, dict):
+            inferred_frames = image_embeds.get("num_frames")
+            if torch.is_tensor(inferred_frames):
+                inferred_frames = int(inferred_frames.item())
+            if inferred_frames is None:
+                target_shape = image_embeds.get("target_shape")
+                if target_shape is not None and len(target_shape) >= 2:
+                    latent_frames = target_shape[1]
+                    if torch.is_tensor(latent_frames):
+                        latent_frames = int(latent_frames.item())
+                    inferred_frames = 1 + (latent_frames - 1) * VAE_STRIDE[0]
+
+        if inferred_frames is None:
+            raise ValueError("Failed to infer frame count from image_embeds. Please connect WanVideoEmptyEmbeds or an equivalent output that provides num_frames.")
+
+        total_frames = enforce_4t_plus_1(int(inferred_frames))
+
+        custom_cuts = []
+        if custom_shot_cut_frames.strip():
+            raw = parse_shot_cut_string(custom_shot_cut_frames)
+            seen = set()
+            for frame in raw:
+                enforced = enforce_4t_plus_1(frame)
+                if 0 < enforced < total_frames and enforced not in seen:
+                    custom_cuts.append(enforced)
+                    seen.add(enforced)
+
+        shot_cuts = []
+        if custom_cuts:
+            for frame in custom_cuts:
+                enforced = enforce_4t_plus_1(frame)
+                if 0 < enforced < total_frames and enforced not in shot_cuts:
+                    shot_cuts.append(enforced)
+        else:
+            shot_cuts = self._auto_shot_cuts(total_frames, len(shots))
+
+        shot_cuts.sort()
+
+        positive_prompt = self._compose_prompt(
+            global_caption,
+            shots,
+            append_shot_summary,
+        )
+
+        text_encoder = WanVideoTextEncode()
+        text_embeds, = text_encoder.process(
+            positive_prompt=positive_prompt,
+            negative_prompt=negative_prompt,
+            t5=t5,
+            force_offload=force_offload,
+            model_to_offload=model_to_offload,
+            use_disk_cache=use_disk_cache,
+            device=device,
+        )
+
+        holocine_args = {
+            "total_frames": total_frames,
+            "shot_cut_frames": shot_cuts,
+            "shot_loras": shot_lora_config,
+            "smooth_windows": smooth_windows,
+        }
+
+        return text_embeds, holocine_args, positive_prompt
+
+
+class WanVideoHolocineSetShotAttention:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL",),
+                "enable": ("BOOLEAN", {"default": False, "tooltip": "Toggle shot-aware sparse attention."}),
+                "global_token_ratio_or_number": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 32768.0,
+                    "step": 0.01,
+                    "tooltip": "≤1.0 => ratio of spatial tokens per shot; ≥64 (integer) => absolute token count.",
+                }),
+            },
+            "optional": {
+                "mask_type": (["none", "id", "normalized", "alternating"], {
+                    "default": "none",
+                    "tooltip": "Shot mask variant. Use 'none' (default) to disable, or select a mask style to add per-shot features."
+                }),
+                "backend": (["full", "sparse_fallback", "sparse_flash_attn"], {
+                    "default": "full",
+                    "tooltip": "Select shot attention backend: full (dense), sparse_fallback (simulated sparse), or sparse_flash_attn (FlashAttention varlen)."
+                }),
+                "i2v_mode": ("BOOLEAN", {"default": False, "tooltip": "Treat the first latent slice as a global anchor (manual I2V mode)."}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply"
+    CATEGORY = "WanVideoWrapper/Holocine"
+
+    def apply(self, model, enable, global_token_ratio_or_number, mask_type="none", backend="full", i2v_mode=False):
+        value = float(global_token_ratio_or_number)
+        if value <= 0.0:
+            raise ValueError("global_token_ratio_or_number must be > 0. Use values ≤ 1.0 for ratios or integers ≥ 64 for absolute counts.")
+        if value > 1.0:
+            if abs(value - round(value)) > 1e-6 or value < 64.0:
+                raise ValueError("global_token_ratio_or_number > 1.0 requires an integer ≥ 64.")
+        patcher = model.clone()
+        transformer_options = patcher.model_options.setdefault("transformer_options", {})
+        transformer_options["shot_attention"] = {
+            "enabled": bool(enable),
+            "global_token_ratio_or_number": value,
+            "mode": "firstk",
+            "mask_type": mask_type,
+            "backend": backend,
+            "i2v_mode": bool(i2v_mode),
+        }
+        return (patcher,)
 
 
 # In-memory cache for prompt extender output
@@ -399,10 +703,28 @@ class WanVideoTextEncode:
             mm.soft_empty_cache()
             gc.collect()
 
+        shot_positions = []
+        if hasattr(encoder, "tokenizer"):
+            for idx, prompt_text in enumerate(positive_prompts):
+                debug_excerpt = prompt_text.replace("\n", " ")[:160]
+                try:
+                    positions = parse_structured_prompt(prompt_text, encoder.tokenizer)
+                    if positions is None:
+                        log.warning(f"Shot prompt parsing returned None for segment {idx}. Prompt excerpt: '{debug_excerpt}'")
+                    else:
+                        log.info(f"Shot prompt parsing succeeded for segment {idx}: global={positions.get('global')}, shots={positions.get('shots')}")
+                except Exception as exc:
+                    log.warning(f"Shot prompt parsing error for segment {idx}: {exc}. Prompt excerpt: '{debug_excerpt}'")
+                    positions = None
+                shot_positions.append(positions)
+        else:
+            shot_positions = [None for _ in positive_prompts]
+
         prompt_embeds_dict = {
             "prompt_embeds": context,
             "negative_prompt_embeds": context_null,
             "echoshot": echoshot,
+            "text_cut_positions": shot_positions,
         }
 
         # Save each part to its own cache file if needed
@@ -2292,6 +2614,10 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoFreeInitArgs": WanVideoFreeInitArgs,
     "WanVideoSetRadialAttention": WanVideoSetRadialAttention,
     "WanVideoBlockList": WanVideoBlockList,
+    "WanVideoHolocineShotArgs": WanVideoHolocineShotArgs,
+    "WanVideoHolocineShotBuilder": WanVideoHolocineShotBuilder,
+    "WanVideoHolocinePromptEncode": WanVideoHolocinePromptEncode,
+    "WanVideoHolocineSetShotAttention": WanVideoHolocineSetShotAttention,
     "WanVideoTextEncodeCached": WanVideoTextEncodeCached,
     "WanVideoAddExtraLatent": WanVideoAddExtraLatent,
     "WanVideoAddStandInLatent": WanVideoAddStandInLatent,
@@ -2335,6 +2661,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoFreeInitArgs": "WanVideo Free Init Args",
     "WanVideoSetRadialAttention": "WanVideo Set Radial Attention",
     "WanVideoBlockList": "WanVideo Block List",
+    "WanVideoHolocineShotArgs": "WanVideo Holocine Shot Args",
+    "WanVideoHolocineShotBuilder": "WanVideo Holocine Shot Builder",
+    "WanVideoHolocinePromptEncode": "WanVideo Holocine Prompt Encode",
+    "WanVideoHolocineSetShotAttention": "WanVideo Holocine Set Shot Attention",
     "WanVideoTextEncodeCached": "WanVideo TextEncode Cached",
     "WanVideoAddExtraLatent": "WanVideo Add Extra Latent",
     "WanVideoAddStandInLatent": "WanVideo Add StandIn Latent",
