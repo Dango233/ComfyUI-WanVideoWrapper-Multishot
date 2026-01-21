@@ -188,9 +188,9 @@
 
 ### D. 模型层 shot attention + cross-attn mask
 - [x] `wanvideo/modules/attention.py` 加入 `sparse_shot_attention` + fallback
-- [ ] `wanvideo/modules/model.py` 解析 `shot_attention_cfg`
-- [ ] cross-attn mask 逻辑接入 `build_cross_attention_mask()`
-- [ ] `shot_embedding` 与 `shot_mask` 拼接逻辑完整
+- [x] `wanvideo/modules/model.py` 解析 `shot_attention_cfg`
+- [x] cross-attn mask 逻辑接入 `build_cross_attention_mask()`
+- [x] `shot_embedding` 与 `shot_mask` 拼接逻辑完整
 
 **Diff 指向**：
 - `git diff 393fe78..main -- wanvideo/modules/attention.py`
@@ -201,7 +201,7 @@
 ### E. Per-shot LoRA 支持
 - [x] `custom_linear.py` 增加 shot_lora cache 与注入
 - [ ] `nodes_sampler.py` 将 LoRA payload 按 shot 聚合并注入 transformer
-- [ ] `wanvideo/modules/model.py` 设定 `CustomLinear.runtime_context`
+- [x] `wanvideo/modules/model.py` 设定 `CustomLinear.runtime_context`
 
 **Diff 指向**：
 - `git diff 393fe78..main -- custom_linear.py`
@@ -256,3 +256,4 @@
 - 2026-01-21 Commit 4：新增 Holocine 节点与结构化 prompt 流程，`WanVideoTextEncode` 输出 `text_cut_positions`。**Checklist 更新：** `B. 节点：Holocine Shot / Prompt / SetShotAttention` 完成。
 - 2026-01-21 Commit 5：`custom_linear.py` 增加 per-shot LoRA 注入与 runtime_context 支持。**Checklist 更新：** `E.custom_linear.py` 完成。
 - 2026-01-21 Commit 6：`wanvideo/modules/attention.py` 新增 sparse shot attention 与 fallback。**Checklist 更新：** `D.attention.py` 完成。
+- 2026-01-21 Commit 7：`wanvideo/modules/model.py` 接入 shot attention、cross-attn mask、shot embedding/mask 与 runtime_context。**Checklist 更新：** `D.model.py` 与 `E.runtime_context` 完成。

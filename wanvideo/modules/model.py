@@ -13,7 +13,8 @@ try:
 except:
     pass
 
-from .attention import attention
+from .attention import attention, sparse_shot_attention
+from .shot_utils import build_cross_attention_mask, build_shot_indices, labels_to_cuts, normalize_smooth_windows
 import numpy as np
 from tqdm import tqdm
 import gc
@@ -22,7 +23,7 @@ from ...utils import log, get_module_memory_mb
 from ...cache_methods.cache_methods import TeaCacheState, MagCacheState, EasyCacheState, relative_l1_distance
 from ...multitalk.multitalk import get_attn_map_with_target
 from ...echoshot.echoshot import rope_apply_z, rope_apply_c, rope_apply_echoshot
-from ...custom_linear import update_lora_step
+from ...custom_linear import update_lora_step, CustomLinear
 
 from ...MTV.mtv import apply_rotary_emb
 from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
@@ -467,7 +468,7 @@ class WanSelfAttention(nn.Module):
         v = (self.v(x) + self.v_loras(x)).view(b, s, n, d)
         return q, k, v
 
-    def forward(self, q, k, v, seq_lens, transformer_options={}, attention_mode_override=None, lynx_ref_feature=None, lynx_ref_scale=1.0, onetoall_ref=None, onetoall_ref_scale=1.0, frame_tokens=1536):
+    def forward(self, q, k, v, seq_lens, transformer_options={}, attention_mode_override=None, lynx_ref_feature=None, lynx_ref_scale=1.0, onetoall_ref=None, onetoall_ref_scale=1.0, frame_tokens=1536, shot_config=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -482,7 +483,42 @@ class WanSelfAttention(nn.Module):
         if self.ref_adapter is not None and lynx_ref_feature is not None:
             ref_x = self.ref_adapter(self, q, lynx_ref_feature)
 
-        x = attention(q, k, v, k_lens=seq_lens, attention_mode=attention_mode, heads=self.num_heads, frame_tokens=frame_tokens, transformer_options=transformer_options)
+        use_shot_attention = False
+        if shot_config is not None:
+            indices = shot_config.get("indices")
+            per_g = shot_config.get("global_tokens", 0)
+            mode = shot_config.get("mode", "firstk")
+            backend = (shot_config.get("backend") or "full") if shot_config else "full"
+            backend = backend.lower()
+            backend = {
+                "sparse_flash": "sparse_flash_attn",
+                "flash": "sparse_flash_attn",
+                "sparse": "sparse_fallback",
+                "dense": "full",
+            }.get(backend, backend)
+            prefix_tokens = int(shot_config.get("prefix_tokens", 0) or 0)
+            if backend == "full":
+                use_shot_attention = False
+            elif backend in {"sparse_flash_attn", "sparse_fallback"} and indices is not None and (per_g > 0 or prefix_tokens > 0):
+                x = sparse_shot_attention(
+                    q,
+                    k,
+                    v,
+                    shot_latent_indices=indices,
+                    num_heads=self.num_heads,
+                    per_g=per_g,
+                    mode=mode,
+                    backend=backend,
+                    attention_mode=attention_mode,
+                    prefix_tokens=prefix_tokens,
+                    smooth_windows=shot_config.get("smooth_windows"),
+                )
+                use_shot_attention = True
+            else:
+                raise ValueError(f"Unsupported shot attention backend '{backend}'.")
+
+        if not use_shot_attention:
+            x = attention(q, k, v, k_lens=seq_lens, attention_mode=attention_mode, heads=self.num_heads, frame_tokens=frame_tokens, transformer_options=transformer_options)
 
         if self.ref_adapter is not None and lynx_ref_feature is not None:
             x = x.add(ref_x, alpha=lynx_ref_scale)
@@ -633,7 +669,7 @@ class WanT2VCrossAttention(WanSelfAttention):
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None, audio_scale=1.0,
                 num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
                 inner_t=None, inner_c=None, cross_freqs=None,
-                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, lynx_x_ip=None, lynx_ip_scale=1.0, longcat_num_cond_latents=None, **kwargs):
+                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, lynx_x_ip=None, lynx_ip_scale=1.0, longcat_num_cond_latents=None, attn_mask=None, **kwargs):
         b, n, d = x.size(0), self.num_heads, self.head_dim
         s = x.size(1)
         # compute query
@@ -662,7 +698,7 @@ class WanT2VCrossAttention(WanSelfAttention):
                 q = rope_apply_z(q, grid_sizes, cross_freqs, inner_t).to(q)
                 k = rope_apply_c(k, cross_freqs, inner_c).to(q)
 
-            x = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
+            x = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads, attn_mask=attn_mask).flatten(2)
 
         if lynx_x_ip is not None and self.ip_adapter is not None and ip_scale !=0:
             lynx_x_ip = self.ip_adapter(self, q, lynx_x_ip)
@@ -728,7 +764,7 @@ class WanI2VCrossAttention(WanSelfAttention):
 
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None,
                 audio_scale=1.0, num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
-                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, **kwargs):
+                adapter_proj=None, adapter_attn_mask=None, ip_scale=1.0, orig_seq_len=None, attn_mask=None, **kwargs):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -745,7 +781,7 @@ class WanI2VCrossAttention(WanSelfAttention):
             # text attention
             k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).view(b, -1, n, d).to(x.dtype)
             v = self.v(context).view(b, -1, n, d)
-            x_text = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
+            x_text = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads, attn_mask=attn_mask).flatten(2)
 
         #img attention
         if clip_embed is not None:
@@ -1006,7 +1042,7 @@ class WanAttentionBlock(nn.Module):
         longcat_num_cond_latents=0, longcat_avatar_options=None, #longcat image cond amount
         x_onetoall_ref=None, onetoall_freqs=None, onetoall_ref=None, onetoall_ref_scale=1.0, #one-to-all
         e_tr=None, tr_num=0, tr_start=0, #token replacement
-        attention_mode_override=None, frame_tokens=None, transformer_options={}
+        attention_mode_override=None, frame_tokens=None, transformer_options={}, shot_config=None, cross_attn_mask=None
     ):
         r"""
         Args:
@@ -1171,7 +1207,7 @@ class WanAttentionBlock(nn.Module):
                 if self.dense_attention_mode == "sparse_sage_attn":
                     y = self.self_attn.forward_radial(q, k, v, dense_step=True)
                 else:
-                    y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override=attention_mode_override)
+                    y = self.self_attn.forward(q, k, v, seq_lens, attention_mode_override=attention_mode_override, shot_config=shot_config)
             else:
                 y = self.self_attn.forward_radial(q, k, v, dense_step=False)
         elif x_ip is not None and self.kv_cache is None: #stand-in
@@ -1184,18 +1220,18 @@ class WanAttentionBlock(nn.Module):
             v_ip = self.kv_cache["v_ip"]
             full_k = torch.cat([k, k_ip], dim=1)
             full_v = torch.cat([v, v_ip], dim=1)
-            y = self.self_attn.forward(q, full_k, full_v, seq_lens, attention_mode_override=attention_mode_override)
+            y = self.self_attn.forward(q, full_k, full_v, seq_lens, attention_mode_override=attention_mode_override, shot_config=shot_config)
         elif is_longcat and longcat_num_cond_latents > 0:
             if longcat_num_cond_latents == 1:
                 num_cond_latents_thw = longcat_num_cond_latents * (N // num_latent_frames)
                 # process the noise tokens
-                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
+                x_noise = self.self_attn.forward(q[:, num_cond_latents_thw:].contiguous(), k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config)
                 # process the condition tokens
                 x_cond = self.self_attn.forward(
                     q[:, :num_cond_latents_thw].contiguous(),
                     k[:, :num_cond_latents_thw].contiguous(),
                     v[:, :num_cond_latents_thw].contiguous(),
-                    seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
+                    seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config)
                 # merge x_cond and x_noise
                 y = torch.cat([x_cond, x_noise], dim=1).contiguous()
             elif longcat_num_cond_latents > 1: # video continuation
@@ -1224,12 +1260,12 @@ class WanAttentionBlock(nn.Module):
                         k_non_ref = k[:, num_ref_latents_thw:].contiguous()
                         v_non_ref = v[:, num_ref_latents_thw:].contiguous()
 
-                        x_noise_front = self.self_attn.forward(q_noise_front, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options) # q_front has attention with ref + cond + noisy
-                        x_noise_back = self.self_attn.forward(q_noise_back, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options) # q_back has attention with ref + cond + noisy
-                        x_noise_maskref = self.self_attn.forward(q_noise_maskref, k_non_ref, v_non_ref, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options) # q_mask has attention with cond+noisy
+                        x_noise_front = self.self_attn.forward(q_noise_front, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config) # q_front has attention with ref + cond + noisy
+                        x_noise_back = self.self_attn.forward(q_noise_back, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config) # q_back has attention with ref + cond + noisy
+                        x_noise_maskref = self.self_attn.forward(q_noise_maskref, k_non_ref, v_non_ref, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config) # q_mask has attention with cond+noisy
                         x_noise = torch.cat([x_noise_front, x_noise_maskref, x_noise_back], dim=1).contiguous()
                     else:
-                        x_noise = self.self_attn.forward(q_noise, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
+                        x_noise = self.self_attn.forward(q_noise, k, v, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config)
                 # process the condition tokens
                 q_ref = q[:, :num_ref_latents_thw].contiguous()
                 k_ref = k[:, :num_ref_latents_thw].contiguous()
@@ -1237,14 +1273,14 @@ class WanAttentionBlock(nn.Module):
                 q_cond = q[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 k_cond = k[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
                 v_cond = v[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
-                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options)
+                x_ref = self.self_attn.forward(q_ref, k_ref, v_ref, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config)
+                x_cond = self.self_attn.forward(q_cond, k_cond, v_cond, seq_lens, attention_mode_override=attention_mode_override, transformer_options=transformer_options, shot_config=shot_config)
 
                 # merge x_cond and x_noise
                 y = torch.cat([x_ref, x_cond, x_noise], dim=1).contiguous()
         else:
             y = self.self_attn.forward(q, k, v, seq_lens, lynx_ref_feature=lynx_ref_feature, lynx_ref_scale=lynx_ref_scale,
-                                       onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale, attention_mode_override=attention_mode_override, transformer_options=transformer_options, frame_tokens=frame_tokens)
+                                       onetoall_ref=onetoall_ref, onetoall_ref_scale=onetoall_ref_scale, attention_mode_override=attention_mode_override, transformer_options=transformer_options, frame_tokens=frame_tokens, shot_config=shot_config)
 
         del q, k, v
 
@@ -1313,7 +1349,7 @@ class WanAttentionBlock(nn.Module):
                 x = x + self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
                                     num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context,
                                     rope_func=self.rope_func, inner_t=inner_t, inner_c=inner_c, cross_freqs=cross_freqs,
-                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents)
+                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents, attn_mask=cross_attn_mask)
                 x = x.to(input_dtype)
                 # MultiTalk
                 if multitalk_audio_embedding is not None and not isinstance(self, VaceWanAttentionBlock):
@@ -1727,6 +1763,9 @@ class WanModel(torch.nn.Module):
                 lynx_ip_layers=None, lynx_ref_layers=None,
                 # LongCat
                 is_longcat=False,
+                max_shots=0,
+                use_shot_embedding=False,
+                shot_embedding_init="zeros",
                 ):
         r"""
         Initialize the diffusion model backbone.
@@ -1789,6 +1828,19 @@ class WanModel(torch.nn.Module):
         self.vace_layers = vace_layers
         self.device = main_device
         self.patched_linear = False
+        self._shot_embedding_warned_missing = False
+        self._shot_embedding_notified_present = False
+        self._shot_mask_channel_warned = False
+
+        if max_shots is None:
+            max_shots = 0
+        try:
+            self.max_shots = int(max(0, max_shots))
+        except (TypeError, ValueError):
+            self.max_shots = 0
+        self.shot_embedding_init = shot_embedding_init
+        self.use_shot_embedding = bool(use_shot_embedding and self.max_shots > 0)
+        self.shot_embedding = nn.Embedding(self.max_shots, self.dim) if self.use_shot_embedding else None
 
         self.blocks_to_swap = -1
         self.offload_txt_emb = False
@@ -2320,6 +2372,11 @@ class WanModel(torch.nn.Module):
         one_to_all_input=None, one_to_all_controlnet_strength=0.0, # One-to-All
         scail_input=None,  # SCAIL pose
         dual_control_input=None,  # LongVie2 dual controlnet
+        shot_indices=None,
+        shot_attention_cfg=None,
+        shot_mask_type=None,
+        text_cut_positions=None,
+        smooth_windows=None,
         transformer_options={},
     ):
         r"""
@@ -2346,6 +2403,8 @@ class WanModel(torch.nn.Module):
         # Stand-In only used on first positive pass, then cached in kv_cache
         if is_uncond or current_step > 0:
             standin_input = None
+
+        CustomLinear.runtime_context = None
 
         # MTV Crafter motion projection
         if mtv_motion_tokens is not None:
@@ -2399,6 +2458,65 @@ class WanModel(torch.nn.Module):
 
         # params
         device = self.main_device
+
+        shot_attention_enabled = bool(shot_attention_cfg and shot_attention_cfg.get("enabled", False))
+        smooth_windows = normalize_smooth_windows(smooth_windows)
+        shot_backend = (shot_attention_cfg.get("backend", "full") if shot_attention_enabled else "full").lower()
+        token_mode = None
+        token_ratio = None
+        token_absolute = None
+        if shot_attention_enabled:
+            valid_backends = {"full", "sparse_fallback", "sparse_flash_attn"}
+            backend_aliases = {"sparse_flash": "sparse_flash_attn", "flash": "sparse_flash_attn", "sparse": "sparse_fallback", "dense": "full"}
+            shot_backend = backend_aliases.get(shot_backend, shot_backend)
+            if shot_backend not in valid_backends:
+                raise ValueError(f"Unsupported shot attention backend '{shot_backend}'. Expected one of {sorted(valid_backends)}.")
+            raw_token_value = shot_attention_cfg.get("global_token_ratio_or_number", 1.0)
+            if not isinstance(raw_token_value, (int, float)):
+                raise ValueError(f"Shot attention expected a numeric global_token_ratio_or_number value, got {type(raw_token_value).__name__} instead.")
+            raw_token_value = float(raw_token_value)
+            if raw_token_value <= 0.0:
+                raise ValueError("Shot attention requires global_token_ratio_or_number to be > 0.")
+            if shot_backend != "full" and raw_token_value <= 1.0:
+                token_mode = "ratio"
+                token_ratio = raw_token_value
+            elif shot_backend != "full":
+                if abs(raw_token_value - round(raw_token_value)) > 1e-6 or raw_token_value < 64:
+                    raise ValueError("Shot attention numeric mode expects an integer ≥ 64 when global_token_ratio_or_number > 1.")
+                token_mode = "absolute"
+                token_absolute = int(round(raw_token_value))
+            else:
+                token_mode = None
+                token_ratio = None
+                token_absolute = None
+        shot_mode = shot_attention_cfg.get("mode", "firstk") if shot_attention_enabled else "firstk"
+        if shot_attention_enabled:
+            if shot_indices is None:
+                raise ValueError("Shot attention is enabled but shot_indices are missing. Ensure WanVideoHolocineShotArgs/Holocine Prompt nodes are connected.")
+            if isinstance(shot_indices, torch.Tensor):
+                shot_indices_tensor = shot_indices.to(device=device, dtype=torch.long)
+            else:
+                shot_indices_tensor = torch.tensor(shot_indices, device=device, dtype=torch.long)
+            if shot_indices_tensor.dim() == 1:
+                shot_indices_tensor = shot_indices_tensor.unsqueeze(0)
+        else:
+            if shot_indices is not None:
+                raise ValueError("shot_indices were provided but shot attention is disabled. Make sure all nodes agree on the mode.")
+            shot_indices_tensor = None
+
+        shot_block_config = None
+        cross_attn_mask = None
+        shot_latent_cuts = None
+        spatial_tokens = None
+        shot_token_labels = None
+
+        shot_positions = None
+        if isinstance(text_cut_positions, list) and len(text_cut_positions) > 0:
+            shot_positions = text_cut_positions[0]
+        elif isinstance(text_cut_positions, dict):
+            shot_positions = text_cut_positions
+        if shot_attention_enabled and (not shot_positions or shot_positions.get("global") is None):
+            raise ValueError("Shot attention is enabled but structured prompt positions are missing. Ensure the prompt includes [global caption]/[per shot caption]/[shot cut] tags.")
 
         if freqs is not None and freqs.device != device:
            freqs = freqs.to(device)
@@ -2477,6 +2595,54 @@ class WanModel(torch.nn.Module):
                 render_latent = nn.functional.interpolate(render_latent, size=(hidden_states.shape[2], hidden_states.shape[3], hidden_states.shape[4]), mode='trilinear', align_corners=False)
             render_latent = torch.cat([hidden_states[:, :20], render_latent], dim=1)
 
+        # Append shot mask feature (Holocine-style) when available and supported
+        mask_mode = (shot_mask_type or "none").lower()
+        valid_mask_modes = {"none", "id", "normalized", "alternating"}
+        if mask_mode not in valid_mask_modes:
+            raise ValueError(f"Shot mask mode '{mask_mode}' is not supported. Expected one of {sorted(valid_mask_modes)}.")
+
+        if isinstance(x, (list, tuple)) and len(x) > 0:
+            sample_channels = x[0].shape[0]
+            expected_in_channels = self.original_patch_embedding.weight.shape[1]
+            if mask_mode == "none" and expected_in_channels == sample_channels + 1:
+                raise ValueError(
+                    "Loaded checkpoint expects an additional shot mask channel (input channels=%d, current=%d). "
+                    "Enable mask_type (e.g. 'id') or load weights trained without the extra channel."
+                    % (expected_in_channels, sample_channels)
+                )
+        if (
+            shot_indices_tensor is not None
+            and isinstance(x, (list, tuple))
+            and len(x) > 0
+            and mask_mode != "none"
+        ):
+            if expected_in_channels == sample_channels + 1:
+                mask_values = None
+                num_shots = int(shot_indices_tensor.max().item()) + 1 if shot_indices_tensor.numel() > 0 else 0
+                shot_indices_float = shot_indices_tensor.to(x[0].dtype)
+                if mask_mode == "id":
+                    mask_values = shot_indices_float
+                elif mask_mode == "normalized":
+                    if num_shots > 1:
+                        mask_values = shot_indices_float / 20.0
+                    else:
+                        mask_values = torch.zeros_like(shot_indices_float)
+                elif mask_mode == "alternating":
+                    mask_values = (shot_indices_tensor % 2).to(x[0].dtype)
+
+                if mask_values is not None:
+                    # Expand to [B, 1, F, H, W] to concatenate per sample
+                    batch_count, latent_frames = mask_values.shape
+                    _, _, height, width = x[0].shape
+                    mask_expanded = mask_values.view(batch_count, 1, latent_frames, 1, 1).expand(batch_count, 1, latent_frames, height, width)
+                    x = [torch.cat([latent, mask_expanded[i]], dim=0) if i < batch_count else latent for i, latent in enumerate(x)]
+            else:
+                raise ValueError(
+                    "Shot mask mode '%s' requires patch embedding to accept an extra channel (expected %d, got %d). "
+                    "Set mask_type='none' or use checkpoints trained with the additional mask channel."
+                    % (mask_mode, expected_in_channels, sample_channels)
+                )
+
         # SteadyDancer
         if sdancer_enabled:
             sdancer_cond = sdancer_input["cond_pos"] if not is_uncond else sdancer_input["cond_neg"]
@@ -2544,7 +2710,82 @@ class WanModel(torch.nn.Module):
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], device=device, dtype=torch.long) for u in x])
         original_grid_sizes = grid_sizes.clone()
         f, h, w = x[0].shape[2:]
+
+        if shot_attention_enabled:
+            batch_latents = len(x)
+            if shot_indices_tensor.shape[0] == 1 and batch_latents > 1:
+                shot_indices_tensor = shot_indices_tensor.repeat(batch_latents, 1)
+            if shot_indices_tensor.shape[0] != batch_latents:
+                raise ValueError("Shot attention: shot_indices batch size does not match the latent batch size.")
+
+            latent_frames = grid_sizes[0][0].item()
+            if shot_indices_tensor.shape[1] != latent_frames:
+                raise ValueError("Shot attention: shot_indices length does not match the latent frame count.")
+
+            spatial_tokens = int(grid_sizes[0][1].item() * grid_sizes[0][2].item())
+            shot_token_labels = shot_indices_tensor.repeat_interleave(spatial_tokens, dim=1)
+
+            if getattr(self, "shot_lora_count", 0) > 0:
+                CustomLinear.runtime_context = {
+                    "token_labels": shot_token_labels.reshape(-1).to(device),
+                    "current_step": current_step,
+                }
+
+            shot_latent_cuts = labels_to_cuts(shot_token_labels)
+
+            prefix_tokens = 0
+            if shot_attention_cfg.get("i2v_mode"):
+                prefix_tokens = spatial_tokens
+
+            if token_mode == "ratio":
+                pooled_tokens = max(1, int(math.ceil(spatial_tokens * token_ratio)))
+            elif token_mode == "absolute":
+                pooled_tokens = token_absolute
+            else:
+                pooled_tokens = spatial_tokens  # unused by sparse backends but keeps structure
+            pooled_tokens = max(1, min(spatial_tokens, pooled_tokens))
+            if shot_backend == "full":
+                shot_block_config = None
+            else:
+                shot_block_config = {
+                    "indices": shot_latent_cuts,
+                    "global_tokens": pooled_tokens,
+                    "mode": shot_mode,
+                    "backend": shot_backend,
+                    "prefix_tokens": prefix_tokens,
+                }
+                if smooth_windows is not None:
+                    shot_block_config["smooth_windows"] = smooth_windows
+                if token_mode is not None:
+                    shot_block_config["token_mode"] = token_mode
+                    if token_mode == "ratio":
+                        shot_block_config["token_ratio"] = token_ratio
+                    else:
+                        shot_block_config["token_absolute"] = token_absolute
+        else:
+            CustomLinear.runtime_context = None
+
+        if shot_attention_enabled:
+            if self.shot_embedding is None:
+                if not self._shot_embedding_warned_missing:
+                    log.info("Shot attention enabled: running without shot embedding.")
+                    self._shot_embedding_warned_missing = True
+            else:
+                if not self._shot_embedding_notified_present:
+                    log.info(f"Shot attention enabled: running with shot embedding (max_shots={self.shot_embedding.num_embeddings}).")
+                    self._shot_embedding_notified_present = True
+
         x = [u.flatten(2).transpose(1, 2) for u in x]
+        if self.shot_embedding is not None and shot_token_labels is not None:
+            embed_device = self.shot_embedding.weight.device
+            shot_ids = shot_token_labels.to(device=embed_device)
+            shot_embs = self.shot_embedding(shot_ids)
+            if shot_embs.device != x[0].device:
+                shot_embs = shot_embs.to(x[0].device)
+            if shot_embs.dtype != x[0].dtype:
+                shot_embs = shot_embs.to(x[0].dtype)
+            for batch_idx in range(len(x)):
+                x[batch_idx] = x[batch_idx] + shot_embs[batch_idx].unsqueeze(0)
         self.original_seq_len = x[0].shape[1]
 
         prev_latent = None
@@ -2846,6 +3087,23 @@ class WanModel(torch.nn.Module):
             context = None
             chunked_self_attention = False
             seq_chunks = 0
+
+        clip_token_count = 0
+        if shot_attention_enabled and shot_positions is not None and context is not None and spatial_tokens is not None:
+            try:
+                context_length = context.shape[1]
+                cross_attn_mask = build_cross_attention_mask(
+                    shot_indices_tensor,
+                    shot_positions,
+                    context_length=context_length,
+                    spatial_tokens=spatial_tokens,
+                    device=x.device,
+                    dtype=x.dtype,
+                    num_image_tokens=clip_token_count,
+                    smooth_windows=smooth_windows,
+                )
+            except Exception as exc:
+                raise ValueError(f\"Failed to build cross-attention mask for shot attention: {exc}\") from exc
 
         # dual control
         if dual_control_input is not None and dual_control_input["start_percent"] <= current_step_percentage <= dual_control_input["end_percent"]:
@@ -3237,7 +3495,18 @@ class WanModel(torch.nn.Module):
                     x_onetoall_ref = onetoall_ref_block_samples[b // interval_ref]
 
                 # ---run block----#
-                x, x_ip, lynx_ref_feature, x_ovi = block(x, x_ip=x_ip, lynx_ref_feature=lynx_ref_feature, x_ovi=x_ovi, x_onetoall_ref=x_onetoall_ref, onetoall_freqs=onetoall_freqs, attention_mode_override=attention_mode, **kwargs)
+                x, x_ip, lynx_ref_feature, x_ovi = block(
+                    x,
+                    x_ip=x_ip,
+                    lynx_ref_feature=lynx_ref_feature,
+                    x_ovi=x_ovi,
+                    x_onetoall_ref=x_onetoall_ref,
+                    onetoall_freqs=onetoall_freqs,
+                    attention_mode_override=attention_mode,
+                    shot_config=shot_block_config if shot_attention_enabled else None,
+                    cross_attn_mask=cross_attn_mask,
+                    **kwargs
+                )
                 # ---post block----#
 
                 # dual controlnet
@@ -3371,6 +3640,7 @@ class WanModel(torch.nn.Module):
 
         x = self.unpatchify(x, original_grid_sizes)
         x = [u[:, prefix_frames:suffix_frames, ...].float() for u in x]
+        CustomLinear.runtime_context = None
         return (x, x_ovi, pred_id) if pred_id is not None else (x, x_ovi, None)
 
     def unpatchify(self, x, grid_sizes):
