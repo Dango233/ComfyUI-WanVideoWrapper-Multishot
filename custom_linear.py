@@ -124,6 +124,7 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
 
 
 class CustomLinear(nn.Linear):
+    runtime_context = None
     def __init__(
         self,
         in_features,
@@ -143,6 +144,8 @@ class CustomLinear(nn.Linear):
         self.lora_strengths = []
         self.allow_compile = allow_compile
         self.is_gguf = is_gguf
+        self.shot_lora = []
+        self.shot_lora_key = None
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -152,6 +155,9 @@ class CustomLinear(nn.Linear):
             self._apply_lora_impl = self._apply_lora_direct
             self._apply_single_lora_impl = self._apply_single_lora_direct
             self._linear_forward_impl = self._linear_forward_direct
+
+    def clear_shot_lora_cache(self):
+        return
 
 
     # Direct implementations (no custom ops)
@@ -261,8 +267,108 @@ class CustomLinear(nn.Linear):
 
         weight = self._get_weight_with_lora(weight)
         out = self._linear_forward_impl(input, weight, bias)
+        if self.shot_lora and CustomLinear.runtime_context is not None:
+            out = self._apply_shot_lora(out, input, weight)
         del weight, input, bias
         return out
+
+    def _apply_shot_lora(self, output, input, weight):
+        ctx = CustomLinear.runtime_context
+        if ctx is None:
+            return output
+
+        token_labels = ctx.get("token_labels")
+        if token_labels is None or token_labels.numel() == 0:
+            return output
+
+        if not self.shot_lora or all(len(components) == 0 or components is None for components in self.shot_lora):
+            return output
+
+        flat_input = input.reshape(-1, input.shape[-1])
+        flat_output = output.reshape(-1, output.shape[-1])
+
+        if token_labels.numel() != flat_input.shape[0]:
+            return output
+
+        device = flat_input.device
+        dtype = flat_input.dtype
+        current_step = ctx.get("current_step", 0)
+        for shot_idx, components in enumerate(self.shot_lora):
+            if not components:
+                continue
+            mask = (token_labels == shot_idx)
+            if not torch.any(mask):
+                continue
+            indices = torch.nonzero(mask, as_tuple=False).flatten()
+            if indices.numel() == 0:
+                continue
+            shot_input = flat_input.index_select(0, indices)
+            shot_delta = None
+            for component in components:
+                if not isinstance(component, dict):
+                    continue
+
+                strength_entry = component.get("strength", 1.0)
+                if isinstance(strength_entry, list):
+                    if current_step >= len(strength_entry):
+                        continue
+                    strength_value = float(strength_entry[current_step])
+                else:
+                    strength_value = float(strength_entry)
+                if strength_value == 0.0:
+                    continue
+
+                up_weight = component.get("up")
+                down_weight = component.get("down")
+                if up_weight is None or down_weight is None:
+                    continue
+
+                up_weight = up_weight.to(device=device, dtype=dtype, non_blocking=True)
+                down_weight = down_weight.to(device=device, dtype=dtype, non_blocking=True)
+
+                if up_weight.ndim != 2 or down_weight.ndim != 2:
+                    continue
+
+                in_dim = shot_input.shape[1]
+                out_dim = flat_output.shape[1]
+
+                if down_weight.shape[1] == in_dim:
+                    down_for_mul = down_weight
+                elif down_weight.shape[0] == in_dim:
+                    down_for_mul = down_weight.transpose(0, 1)
+                else:
+                    rank_hint = component.get("rank")
+                    if rank_hint is not None and down_weight.shape[0] == rank_hint:
+                        down_for_mul = down_weight
+                    elif rank_hint is not None and down_weight.shape[1] == rank_hint:
+                        down_for_mul = down_weight.transpose(0, 1)
+                    else:
+                        continue
+
+                rank = down_for_mul.shape[0]
+
+                if up_weight.shape[0] == out_dim and up_weight.shape[1] == rank:
+                    up_for_mul = up_weight
+                elif up_weight.shape[1] == out_dim and up_weight.shape[0] == rank:
+                    up_for_mul = up_weight.transpose(0, 1)
+                else:
+                    continue
+
+                alpha_entry = component.get("alpha")
+                if alpha_entry is None:
+                    scale = strength_value
+                else:
+                    scale = strength_value * (float(alpha_entry) / max(rank, 1))
+
+                low_rank = torch.matmul(shot_input, down_for_mul.transpose(0, 1))
+                contribution = torch.matmul(low_rank, up_for_mul.transpose(0, 1))
+                contribution = contribution * scale
+                shot_delta = contribution if shot_delta is None else (shot_delta + contribution)
+
+            if shot_delta is not None:
+                flat_output.index_add_(0, indices, shot_delta)
+
+        return flat_output.view_as(output)
 
 def update_lora_step(module, step):
     for name, submodule in module.named_modules():
@@ -271,6 +377,8 @@ def update_lora_step(module, step):
 
 def remove_lora_from_module(module):
     for name, submodule in module.named_modules():
+        if isinstance(submodule, CustomLinear):
+            submodule.clear_shot_lora_cache()
         if hasattr(submodule, "lora_diffs"):
             for i in range(len(submodule.lora_diffs)):
                 if hasattr(submodule, f"lora_diff_{i}_0"):
@@ -279,3 +387,24 @@ def remove_lora_from_module(module):
                     delattr(submodule, f"lora_diff_{i}_1")
                 if hasattr(submodule, f"lora_diff_{i}_2"):
                     delattr(submodule, f"lora_diff_{i}_2")
+
+
+def set_shot_lora_params(module, shot_payload, module_prefix=""):
+    for name, child in module.named_children():
+        child_prefix = f"{module_prefix}{name}."
+        set_shot_lora_params(child, shot_payload, child_prefix)
+
+    if isinstance(module, CustomLinear):
+        module.clear_shot_lora_cache()
+        key = f"diffusion_model.{module_prefix}weight"
+        shot_components = shot_payload.get(key)
+        if shot_components is None and "_orig_mod." in key:
+            alt_key = key.replace("_orig_mod.", "")
+            shot_components = shot_payload.get(alt_key)
+
+        if shot_components is None:
+            module.shot_lora = []
+            module.shot_lora_key = key
+        else:
+            module.shot_lora = [components if components is not None else [] for components in shot_components]
+            module.shot_lora_key = key

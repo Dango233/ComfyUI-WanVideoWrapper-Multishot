@@ -199,7 +199,7 @@
 ---
 
 ### E. Per-shot LoRA 支持
-- [ ] `custom_linear.py` 增加 shot_lora cache 与注入
+- [x] `custom_linear.py` 增加 shot_lora cache 与注入
 - [ ] `nodes_sampler.py` 将 LoRA payload 按 shot 聚合并注入 transformer
 - [ ] `wanvideo/modules/model.py` 设定 `CustomLinear.runtime_context`
 
@@ -254,3 +254,4 @@
 - 2026-01-21 Commit 2：新增 `wanvideo/modules/shot_utils.py` 并在 `__init__.py` 建立 `wanvideo.modules.shot_utils` 映射。**Checklist 更新：** `A. 新增 shot_utils 基础能力` 完成。
 - 2026-01-21 Commit 3：`tokenizers.py` 增加 fast->slow fallback，`t5.py` 统一日志输出。**Checklist 更新：** `F. Tokenizer 兼容与日志` 完成。
 - 2026-01-21 Commit 4：新增 Holocine 节点与结构化 prompt 流程，`WanVideoTextEncode` 输出 `text_cut_positions`。**Checklist 更新：** `B. 节点：Holocine Shot / Prompt / SetShotAttention` 完成。
+- 2026-01-21 Commit 5：`custom_linear.py` 增加 per-shot LoRA 注入与 runtime_context 支持。**Checklist 更新：** `E.custom_linear.py` 完成。
