@@ -4,7 +4,8 @@ import numpy as np
 from tqdm import tqdm
 import inspect
 from .wanvideo.modules.model import rope_params
-from .custom_linear import remove_lora_from_module, set_lora_params, _replace_linear
+from .custom_linear import remove_lora_from_module, set_lora_params, set_shot_lora_params, _replace_linear
+from .wanvideo.modules.shot_utils import build_shot_indices, SMOOTH_WINDOW_TOKENS
 from .wanvideo.schedulers import get_scheduler, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
 from .multitalk.multitalk import add_noise
@@ -12,14 +13,15 @@ from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scal
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling, offload_transformer, init_blockswap)
 from .multitalk.multitalk_loop import multitalk_loop
 from .cache_methods.cache_methods import cache_report
-from .nodes_model_loading import load_weights
+from .nodes_model_loading import load_weights, standardize_lora_key_format, filter_state_dict_by_blocks, model_lora_keys_unet
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .WanMove.trajectory import replace_feature
 from contextlib import nullcontext
 
 from comfy import model_management as mm
-from comfy.utils import ProgressBar
+from comfy.utils import ProgressBar, load_torch_file
 from comfy.cli_args import args, LatentPreviewMethod
+import comfy.lora as comfy_lora
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,6 +32,131 @@ rope_functions = ["default", "comfy", "comfy_chunked"]
 
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
+
+
+def prepare_shot_lora_payload(base_model, shot_lora_specs):
+    """Load and organize per-shot LoRA adapters for Holocine workflows."""
+    if not shot_lora_specs:
+        return []
+
+    key_map = model_lora_keys_unet(base_model, {})
+    payload = []
+
+    for shot_idx, lora_entries in enumerate(shot_lora_specs):
+        if not lora_entries:
+            payload.append({})
+            continue
+
+        shot_patch = {}
+        for entry in lora_entries:
+            if not isinstance(entry, dict):
+                continue
+
+            lora_path = entry.get("path")
+            if not lora_path:
+                raise ValueError(f"Shot LoRA entry is missing 'path' (shot index {shot_idx}).")
+            if not os.path.exists(lora_path):
+                raise ValueError(f"Shot LoRA file not found: {lora_path}")
+
+            strength_raw = entry.get("strength", 1.0)
+            if isinstance(strength_raw, list):
+                strength_value = [float(s) for s in strength_raw]
+            else:
+                strength_value = float(strength_raw)
+
+            lora_sd = load_torch_file(lora_path, safe_load=True)
+            lora_sd = standardize_lora_key_format(lora_sd)
+
+            selected_blocks = entry.get("blocks", {})
+            layer_filter = entry.get("layer_filter", [])
+            if selected_blocks:
+                lora_sd = filter_state_dict_by_blocks(lora_sd, selected_blocks, layer_filter)
+
+            patch_dict = comfy_lora.load_lora(lora_sd, key_map, log_missing=False)
+
+            for raw_key, patch_value in patch_dict.items():
+                if isinstance(raw_key, str):
+                    mapped_key = raw_key
+                else:
+                    mapped_key = raw_key[0]
+
+                weights_tuple = getattr(patch_value, "weights", None)
+                if (
+                    not isinstance(weights_tuple, tuple)
+                    or len(weights_tuple) < 2
+                    or not isinstance(weights_tuple[0], torch.Tensor)
+                    or not isinstance(weights_tuple[1], torch.Tensor)
+                ):
+                    log.warning(
+                        f"Shot LoRA entry {mapped_key} is not a standard linear LoRA and will be skipped in per-shot mode."
+                    )
+                    continue
+
+                up_tensor = weights_tuple[0]
+                down_tensor = weights_tuple[1]
+                alpha_entry = weights_tuple[2] if len(weights_tuple) > 2 else None
+                mid_entry = weights_tuple[3] if len(weights_tuple) > 3 else None
+                dora_entry = weights_tuple[4] if len(weights_tuple) > 4 else None
+                reshape_entry = weights_tuple[5] if len(weights_tuple) > 5 else None
+
+                if mid_entry is not None or dora_entry is not None or (reshape_entry not in (None, [])):
+                    log.warning(
+                        f"Shot LoRA entry {mapped_key} requires non-linear adapter features and will be skipped in per-shot mode."
+                    )
+                    continue
+
+                if up_tensor.ndim != 2 or down_tensor.ndim != 2:
+                    log.warning(
+                        f"Shot LoRA entry {mapped_key} has unexpected tensor rank (up {up_tensor.ndim}, down {down_tensor.ndim}); skipping."
+                    )
+                    continue
+
+                up_cpu = up_tensor.to(torch.float32).cpu().contiguous()
+                down_cpu = down_tensor.to(torch.float32).cpu().contiguous()
+
+                alpha_value = None
+                if isinstance(alpha_entry, torch.Tensor):
+                    alpha_value = float(alpha_entry.item())
+                elif isinstance(alpha_entry, (int, float)):
+                    alpha_value = float(alpha_entry)
+
+                rank_hint = min(up_cpu.shape[0], up_cpu.shape[1], down_cpu.shape[0], down_cpu.shape[1])
+
+                component = {
+                    "strength": strength_value,
+                    "up": up_cpu,
+                    "down": down_cpu,
+                    "rank": rank_hint,
+                }
+
+                if alpha_value is not None:
+                    component["alpha"] = alpha_value
+
+                shot_patch.setdefault(mapped_key, []).append(component)
+
+            del lora_sd
+
+        payload.append(shot_patch)
+
+    return payload
+
+
+def assign_shot_lora_to_transformer(transformer, shot_lora_payload):
+    if not shot_lora_payload:
+        set_shot_lora_params(transformer, {})
+        transformer.shot_lora_count = 0
+        return 0
+
+    shot_count = len(shot_lora_payload)
+    per_module = {}
+    for shot_idx, shot_patch in enumerate(shot_lora_payload):
+        for key, components in shot_patch.items():
+            slots = per_module.setdefault(key, [None] * shot_count)
+            slots[shot_idx] = components
+
+    set_shot_lora_params(transformer, per_module)
+    transformer.shot_lora_count = shot_count
+    return shot_count
 
 
 class WanVideoSampler:
@@ -66,6 +193,7 @@ class WanVideoSampler:
                 "uni3c_embeds": ("UNI3C_EMBEDS", ),
                 "multitalk_embeds": ("MULTITALK_EMBEDS", ),
                 "freeinit_args": ("FREEINITARGS", ),
+                "holocine_args": ("HOLOCINE_SHOTARGS", ),
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
@@ -80,7 +208,7 @@ class WanVideoSampler:
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, holocine_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
         patcher = model
@@ -98,6 +226,38 @@ class WanVideoSampler:
 
         transformer_options = copy.deepcopy(patcher.model_options.get("transformer_options", None))
         merge_loras = transformer_options["merge_loras"]
+
+        model_shot_cfg = transformer_options.get("shot_attention") if transformer_options is not None else None
+        model_shot_enabled = bool(model_shot_cfg and model_shot_cfg.get("enabled", False))
+
+        args_present = holocine_args is not None
+
+        if model_shot_enabled:
+            if not args_present:
+                raise ValueError("Holocine shot attention was enabled during model load, but Holocine shot args are missing.")
+        else:
+            if args_present:
+                raise ValueError("Holocine shot args detected, but shot attention was not enabled in WanVideoHolocineSetShotAttention")
+
+        if not model_shot_enabled:
+            shot_attention_cfg = None
+            shot_mask_type = None
+        else:
+            shot_attention_cfg = dict(model_shot_cfg)
+            shot_attention_cfg.setdefault("enabled", True)
+            shot_attention_cfg["mode"] = "firstk"
+            shot_attention_cfg.setdefault("mask_type", "none")
+            shot_attention_cfg.setdefault("backend", "full")
+            shot_attention_cfg.setdefault("global_token_ratio_or_number", 1.0)
+            shot_mask_type = shot_attention_cfg.get("mask_type")
+
+        shot_lora_specs = holocine_args.get("shot_loras") if args_present else None
+        shot_lora_payload = []
+        if shot_lora_specs:
+            shot_lora_payload = prepare_shot_lora_payload(patcher.model, shot_lora_specs)
+            if all(len(entry) == 0 for entry in shot_lora_payload):
+                shot_lora_payload = []
+        assign_shot_lora_to_transformer(transformer, shot_lora_payload)
 
         block_swap_args = transformer_options.get("block_swap_args", None)
         if block_swap_args is not None:
@@ -159,6 +319,10 @@ class WanVideoSampler:
             }
         else:
             text_embeds = dict_to_device(text_embeds, device)
+
+        text_cut_positions = text_embeds.get("text_cut_positions") if isinstance(text_embeds, dict) else None
+
+        shot_indices_tensor = None
 
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
@@ -494,6 +658,40 @@ class WanVideoSampler:
             has_ref = image_cond is not None or has_ref
 
         latent_video_length = noise.shape[1]
+
+        smooth_windows = None
+        if shot_attention_cfg:
+            debug_info = {"holocine_args_present": holocine_args is not None,
+                           "text_cut_positions_type": type(text_cut_positions).__name__,
+                           "model_shot_cfg": shot_attention_cfg,
+                           "prompt_positions_sample": None}
+            if isinstance(text_cut_positions, list) and len(text_cut_positions) > 0:
+                debug_info["prompt_positions_sample"] = text_cut_positions[0]
+                first_shot_positions = text_cut_positions[0]
+            elif isinstance(text_cut_positions, dict):
+                debug_info["prompt_positions_sample"] = text_cut_positions
+                first_shot_positions = text_cut_positions
+            else:
+                raise ValueError(f"Shot attention requires structured prompt metadata, but text_cut_positions is missing. Debug: {debug_info}")
+
+            if not first_shot_positions or first_shot_positions.get('global') is None:
+                raise ValueError(f"Shot attention expects [global caption]/[per shot caption]/[shot cut] tags in the prompt. Debug: {debug_info}")
+
+            shot_cut_frames = holocine_args.get("shot_cut_frames", [])
+            smooth_windows = holocine_args.get("smooth_windows")
+            if smooth_windows is None:
+                legacy_flags = holocine_args.get("smooth_transitions")
+                if legacy_flags is not None:
+                    smooth_windows = [SMOOTH_WINDOW_TOKENS if bool(flag) else 0 for flag in legacy_flags]
+            try:
+                shot_indices_tensor = build_shot_indices(latent_video_length, shot_cut_frames)
+                shot_indices_tensor = shot_indices_tensor.to(device)
+            except Exception as exc:
+                raise ValueError(f"Failed to build shot indices: {exc}. Debug: {debug_info}") from exc
+        else:
+            first_shot_positions = None
+            shot_indices_tensor = None
+            smooth_windows = None
 
         # Initialize FreeInit filter if enabled
         freq_filter = None
@@ -1445,6 +1643,11 @@ class WanVideoSampler:
                     'fun_camera': control_camera_input if control_camera_latents is not None else None, # Fun model camera embed
                     'audio_proj': audio_proj if fantasytalking_embeds is not None else None, # FantasyTalking audio projection
                     'audio_scale': audio_scale, # FantasyTalking audio scale
+                    'shot_indices': shot_indices_tensor,
+                    'shot_attention_cfg': shot_attention_cfg,
+                    'shot_mask_type': shot_mask_type,
+                    'text_cut_positions': first_shot_positions if shot_attention_cfg else None,
+                    'smooth_windows': smooth_windows if shot_attention_cfg else None,
                     "uni3c_data": uni3c_data_input, # Uni3C input
                     "controlnet": controlnet, # TheDenk's controlnet input
                     "add_cond": add_cond_input, # additional conditioning input
@@ -1530,117 +1733,138 @@ class WanVideoSampler:
                             else:
                                 return noise_pred_cond, noise_pred_ovi, [cache_state_cond]
 
-                        #unconditional (negative) pass
-                        base_params['is_uncond'] = True
-                        base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
-                        base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None # QwenVL embeddings for Bindweave
-                        base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
-                        if wananim_face_pixels is not None:
-                            base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
-                        if humo_audio_input_neg is not None:
-                            base_params['humo_audio'] = humo_audio_input_neg
-                        if neg_latent is not None:
-                            base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
+                        positions_backup = None
+                        smooth_backup = None
+                        shot_cfg_backup = None
+                        shot_indices_backup = None
+                        if shot_attention_cfg:
+                            positions_backup = base_params.get('text_cut_positions')
+                            smooth_backup = base_params.get('smooth_windows')
+                            shot_cfg_backup = base_params.get('shot_attention_cfg')
+                            shot_indices_backup = base_params.get('shot_indices')
+                            base_params['shot_attention_cfg'] = None
+                            base_params['shot_indices'] = None
+                            base_params['text_cut_positions'] = None
+                            base_params['smooth_windows'] = None
+                        try:
+                            #unconditional (negative) pass
+                            base_params['is_uncond'] = True
+                            base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                            base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None # QwenVL embeddings for Bindweave
+                            base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
+                            if wananim_face_pixels is not None:
+                                base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                            if humo_audio_input_neg is not None:
+                                base_params['humo_audio'] = humo_audio_input_neg
+                            if neg_latent is not None:
+                                base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
 
-                        noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = transformer(
-                            context=negative_embeds if humo_audio_input_neg is None else positive_embeds, #ti #t
-                            pred_id=cache_state[1] if cache_state else None,
-                            vace_data=vace_data, attn_cond=attn_cond_neg,
-                            **base_params)
-                        noise_pred_uncond_text = noise_pred_uncond_text[0]
-                        noise_pred_ovi_uncond = noise_pred_ovi_uncond[0] if noise_pred_ovi_uncond is not None else None
-
-                        # HuMo
-                        if not math.isclose(humo_audio_cfg_scale[idx], 1.0):
-                            if cache_state is not None and len(cache_state) != 3:
-                                cache_state.append(None)
-                            if humo_image_cond is not None and humo_audio_input_neg is not None:
-                                if t > 980 and humo_image_cond_neg_input is not None: # use image cond for first timesteps
-                                    base_params['y'] = [humo_image_cond_neg_input]
-
-                                noise_pred_humo_audio_uncond, _, cache_state_humo = transformer(
-                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                            noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = transformer(
+                                context=negative_embeds if humo_audio_input_neg is None else positive_embeds, #ti #t
+                                pred_id=cache_state[1] if cache_state else None,
+                                vace_data=vace_data, attn_cond=attn_cond_neg,
                                 **base_params)
+                            noise_pred_uncond_text = noise_pred_uncond_text[0]
+                            noise_pred_ovi_uncond = noise_pred_ovi_uncond[0] if noise_pred_ovi_uncond is not None else None
 
-                                noise_pred = (noise_pred_uncond_text + humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio_uncond[0])
-                                            + (cfg_scale - 2.0) * (noise_pred_humo_audio_uncond[0] - noise_pred_uncond_text))
-                                return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_humo]
-                            elif humo_audio_input is not None:
-                                if cache_state is not None and len(cache_state) != 4:
-                                    cache_state.append(None)
-                                # audio
-                                noise_pred_humo_null, _, cache_state_humo = transformer(
-                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                                **base_params)
-                                # negative
-                                if humo_audio_input is not None:
-                                    base_params['humo_audio'] = humo_audio_input
-                                noise_pred_humo_audio, _, cache_state_humo2 = transformer(
-                                context=positive_embeds, pred_id=cache_state[3] if cache_state else None, vace_data=None,
-                                **base_params)
-                                noise_pred = (humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio[0])
-                                    + cfg_scale * (noise_pred_humo_audio[0] - noise_pred_uncond_text)
-                                    + cfg_scale * (noise_pred_uncond_text - noise_pred_humo_null[0])
-                                    + noise_pred_humo_null[0])
-                                return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_humo, cache_state_humo2]
-
-                        #phantom
-                        if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
-                            if cache_state is not None and len(cache_state) != 3:
-                                cache_state.append(None)
-                            noise_pred_phantom, _, cache_state_phantom = transformer(
-                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                            **base_params)
-
-                            noise_pred = (noise_pred_uncond_text + phantom_cfg_scale[idx] * (noise_pred_phantom[0] - noise_pred_uncond_text)
-                                          + cfg_scale * (noise_pred_cond - noise_pred_phantom[0]))
-                            return noise_pred, None,[cache_state_cond, cache_state_uncond, cache_state_phantom]
-                        # audio cfg (fantasytalking and multitalk)
-                        if (fantasytalking_embeds is not None or multitalk_audio_input is not None):
-                            if not math.isclose(audio_cfg_scale[idx], 1.0):
+                            # HuMo
+                            if not math.isclose(humo_audio_cfg_scale[idx], 1.0):
                                 if cache_state is not None and len(cache_state) != 3:
                                     cache_state.append(None)
+                                if humo_image_cond is not None and humo_audio_input_neg is not None:
+                                    if t > 980 and humo_image_cond_neg_input is not None: # use image cond for first timesteps
+                                        base_params['y'] = [humo_image_cond_neg_input]
 
-                                base_params['audio_proj'] = None
-                                base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:] if multitalk_audio_input is not None else None
-                                base_params['is_uncond'] = False
-                                noise_pred_uncond_audio, _, cache_state_audio = transformer(
-                                    context=negative_embeds,
-                                    pred_id=cache_state[2] if cache_state else None,
-                                    vace_data=vace_data,
+                                    noise_pred_humo_audio_uncond, _, cache_state_humo = transformer(
+                                    context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
                                     **base_params)
-                                noise_pred_uncond_audio = noise_pred_uncond_audio[0]
 
-                                noise_pred = noise_pred_uncond_audio + cfg_scale * (
-                                    (noise_pred_cond - noise_pred_uncond_text)
-                                    + audio_cfg_scale[idx] * (noise_pred_uncond_text - noise_pred_uncond_audio))
-                                return noise_pred, None,[cache_state_cond, cache_state_uncond, cache_state_audio]
-                        # lynx
-                        if lynx_embeds is not None and not math.isclose(lynx_cfg_scale[idx], 1.0):
+                                    noise_pred = (noise_pred_uncond_text + humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio_uncond[0])
+                                                + (cfg_scale - 2.0) * (noise_pred_humo_audio_uncond[0] - noise_pred_uncond_text))
+                                    return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_humo]
+                                elif humo_audio_input is not None:
+                                    if cache_state is not None and len(cache_state) != 4:
+                                        cache_state.append(None)
+                                    # audio
+                                    noise_pred_humo_null, _, cache_state_humo = transformer(
+                                    context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                    **base_params)
+                                    # negative
+                                    if humo_audio_input is not None:
+                                        base_params['humo_audio'] = humo_audio_input
+                                    noise_pred_humo_audio, _, cache_state_humo2 = transformer(
+                                    context=positive_embeds, pred_id=cache_state[3] if cache_state else None, vace_data=None,
+                                    **base_params)
+                                    noise_pred = (humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio[0])
+                                        + cfg_scale * (noise_pred_humo_audio[0] - noise_pred_uncond_text)
+                                        + cfg_scale * (noise_pred_uncond_text - noise_pred_humo_null[0])
+                                        + noise_pred_humo_null[0])
+                                    return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_humo, cache_state_humo2]
+
+                            #phantom
+                            if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
+                                if cache_state is not None and len(cache_state) != 3:
+                                    cache_state.append(None)
+                                noise_pred_phantom, _, cache_state_phantom = transformer(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params)
+
+                                noise_pred = (noise_pred_uncond_text + phantom_cfg_scale[idx] * (noise_pred_phantom[0] - noise_pred_uncond_text)
+                                              + cfg_scale * (noise_pred_cond - noise_pred_phantom[0]))
+                                return noise_pred, None,[cache_state_cond, cache_state_uncond, cache_state_phantom]
+                            # audio cfg (fantasytalking and multitalk)
+                            if (fantasytalking_embeds is not None or multitalk_audio_input is not None):
+                                if not math.isclose(audio_cfg_scale[idx], 1.0):
+                                    if cache_state is not None and len(cache_state) != 3:
+                                        cache_state.append(None)
+
+                                    base_params['audio_proj'] = None
+                                    base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:] if multitalk_audio_input is not None else None
+                                    base_params['is_uncond'] = False
+                                    noise_pred_uncond_audio, _, cache_state_audio = transformer(
+                                        context=negative_embeds,
+                                        pred_id=cache_state[2] if cache_state else None,
+                                        vace_data=vace_data,
+                                        **base_params)
+                                    noise_pred_uncond_audio = noise_pred_uncond_audio[0]
+
+                                    noise_pred = noise_pred_uncond_audio + cfg_scale * (
+                                        (noise_pred_cond - noise_pred_uncond_text)
+                                        + audio_cfg_scale[idx] * (noise_pred_uncond_text - noise_pred_uncond_audio))
+                                    return noise_pred, None,[cache_state_cond, cache_state_uncond, cache_state_audio]
+                            # lynx
+                            if lynx_embeds is not None and not math.isclose(lynx_cfg_scale[idx], 1.0):
+                                base_params['is_uncond'] = False
+                                if cache_state is not None and len(cache_state) != 3:
+                                    cache_state.append(None)
+                                noise_pred_lynx, _, cache_state_lynx = transformer(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params)
+
+                                noise_pred = (noise_pred_uncond_text + lynx_cfg_scale[idx] * (noise_pred_lynx[0] - noise_pred_uncond_text)
+                                              + cfg_scale * (noise_pred_cond - noise_pred_lynx[0]))
+                                return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_lynx]
+                            # one-to-all
+                            if one_to_all_data is not None and not math.isclose(one_to_all_pose_cfg_scale[idx], 1.0):
+                                tqdm.write("One-to-All pose CFG pass...")
+                                base_params['is_uncond'] = False
+                                base_params['one_to_all_controlnet_strength'] = 0.0
+                                if cache_state is not None and len(cache_state) != 3:
+                                    cache_state.append(None)
+                                noise_pred_pose_uncond, _, cache_state_ref = transformer(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params)
+
+                                noise_pred = (noise_pred_uncond_text + one_to_all_pose_cfg_scale[idx] * (noise_pred_pose_uncond[0] - noise_pred_uncond_text)
+                                              + cfg_scale * (noise_pred_cond - noise_pred_pose_uncond[0]))
+                                return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_ref]
+                        finally:
+                            if shot_attention_cfg:
+                                base_params['shot_attention_cfg'] = shot_cfg_backup
+                                base_params['shot_indices'] = shot_indices_backup
+                                base_params['text_cut_positions'] = positions_backup
+                                base_params['smooth_windows'] = smooth_backup
                             base_params['is_uncond'] = False
-                            if cache_state is not None and len(cache_state) != 3:
-                                cache_state.append(None)
-                            noise_pred_lynx, _, cache_state_lynx = transformer(
-                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                            **base_params)
-
-                            noise_pred = (noise_pred_uncond_text + lynx_cfg_scale[idx] * (noise_pred_lynx[0] - noise_pred_uncond_text)
-                                          + cfg_scale * (noise_pred_cond - noise_pred_lynx[0]))
-                            return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_lynx]
-                        # one-to-all
-                        if one_to_all_data is not None and not math.isclose(one_to_all_pose_cfg_scale[idx], 1.0):
-                            tqdm.write("One-to-All pose CFG pass...")
-                            base_params['is_uncond'] = False
-                            base_params['one_to_all_controlnet_strength'] = 0.0
-                            if cache_state is not None and len(cache_state) != 3:
-                                cache_state.append(None)
-                            noise_pred_pose_uncond, _, cache_state_ref = transformer(
-                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                            **base_params)
-
-                            noise_pred = (noise_pred_uncond_text + one_to_all_pose_cfg_scale[idx] * (noise_pred_pose_uncond[0] - noise_pred_uncond_text)
-                                          + cfg_scale * (noise_pred_cond - noise_pred_pose_uncond[0]))
-                            return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_ref]
 
                     #batched
                     else:

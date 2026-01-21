@@ -176,10 +176,10 @@
 ---
 
 ### C. Sampler 注入（shot_indices + text_cut_positions）
-- [ ] `nodes_sampler.py` 接收 `holocine_args` 并校验
-- [ ] `build_shot_indices()` 构建 shot_indices
-- [ ] 将 `shot_indices/shot_attention_cfg/shot_mask_type/text_cut_positions/smooth_windows` 注入 model
-- [ ] CFG negative pass 时临时关闭 shot attention
+- [x] `nodes_sampler.py` 接收 `holocine_args` 并校验
+- [x] `build_shot_indices()` 构建 shot_indices
+- [x] 将 `shot_indices/shot_attention_cfg/shot_mask_type/text_cut_positions/smooth_windows` 注入 model
+- [x] CFG negative pass 时临时关闭 shot attention
 
 **Diff 指向**：
 - `git diff 393fe78..main -- nodes_sampler.py`
@@ -201,7 +201,7 @@
 
 ### E. Per-shot LoRA 支持
 - [x] `custom_linear.py` 增加 shot_lora cache 与注入
-- [ ] `nodes_sampler.py` 将 LoRA payload 按 shot 聚合并注入 transformer
+- [x] `nodes_sampler.py` 将 LoRA payload 按 shot 聚合并注入 transformer
 - [x] `wanvideo/modules/model.py` 设定 `CustomLinear.runtime_context`
 
 **Diff 指向**：
@@ -259,3 +259,4 @@
 - 2026-01-21 Commit 6：`wanvideo/modules/attention.py` 新增 sparse shot attention 与 fallback。**Checklist 更新：** `D.attention.py` 完成。
 - 2026-01-21 Commit 7：`wanvideo/modules/model.py` 接入 shot attention、cross-attn mask、shot embedding/mask 与 runtime_context。**Checklist 更新：** `D.model.py` 与 `E.runtime_context` 完成。
 - 2026-01-21 Commit 8：`nodes_model_loading.py` 增加 shot embedding 权重检测并传入模型配置。**Checklist 更新：** `D.nodes_model_loading.py` 完成。
+- 2026-01-21 Commit 9：`nodes_sampler.py` 接入 holocine_args、shot attention 参数、shot_indices/smooth_windows 与 per-shot LoRA，CFG negative pass 暂时关闭 shot attention。**Checklist 更新：** `C. Sampler 注入`、`E.nodes_sampler.py` 完成。
