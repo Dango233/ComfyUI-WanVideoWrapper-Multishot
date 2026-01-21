@@ -3,8 +3,11 @@ import html
 import string
 
 import ftfy
+import logging
 import regex as re
 from transformers import AutoTokenizer
+
+log = logging.getLogger(__name__)
 
 __all__ = ['HuggingfaceTokenizer']
 
@@ -43,7 +46,20 @@ class HuggingfaceTokenizer:
         self.clean = clean
 
         # init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
+        tokenizer_kwargs = dict(kwargs)
+        tokenizer_kwargs.setdefault('use_fast', True)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(name, **tokenizer_kwargs)
+        except Exception as exc:
+            if tokenizer_kwargs.get('use_fast'):
+                log.warning("Falling back to slow tokenizer for %s due to: %s", name, exc)
+                tokenizer_kwargs['use_fast'] = False
+                self.tokenizer = AutoTokenizer.from_pretrained(name, **tokenizer_kwargs)
+            else:
+                raise
+
+        if not getattr(self.tokenizer, 'is_fast', False):
+            log.warning("Tokenizer %s initialized without fast backend; offset mappings may be unavailable", name)
         self.vocab_size = self.tokenizer.vocab_size
 
     def __call__(self, sequence, **kwargs):

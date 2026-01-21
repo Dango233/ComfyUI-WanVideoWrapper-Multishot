@@ -209,8 +209,8 @@
 ---
 
 ### F. Tokenizer 兼容与日志
-- [ ] `tokenizers.py` fast 失败 fallback slow
-- [ ] `t5.py` 日志风格与 upstream 一致
+- [x] `tokenizers.py` fast 失败 fallback slow
+- [x] `t5.py` 日志风格与 upstream 一致
 
 **Diff 指向**：
 - `git diff 393fe78..main -- wanvideo/modules/tokenizers.py`
@@ -250,3 +250,4 @@
 ## 7. 实施记录
 - 2026-01-21 Commit 1：新增 `docs/multishot_refactor_plan.md`，删除旧文档 `docs/reimplement_main_since_upstream.md`（文档基线确立）。**Checklist 更新：** `Z. 文档与流程` 完成。
 - 2026-01-21 Commit 2：新增 `wanvideo/modules/shot_utils.py` 并在 `__init__.py` 建立 `wanvideo.modules.shot_utils` 映射。**Checklist 更新：** `A. 新增 shot_utils 基础能力` 完成。
+- 2026-01-21 Commit 3：`tokenizers.py` 增加 fast->slow fallback，`t5.py` 统一日志输出。**Checklist 更新：** `F. Tokenizer 兼容与日志` 完成。

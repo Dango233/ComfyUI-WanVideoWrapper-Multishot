@@ -20,6 +20,8 @@ __all__ = [
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
+log = logging.getLogger(__name__)
+
 def fp16_clamp(x):
     if x.dtype == torch.float16 and torch.isinf(x).any():
         clamp = torch.finfo(x.dtype).max - 1000
@@ -511,5 +513,5 @@ class T5EncoderModel:
         mask = mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         context = self.model(ids, mask)
-        print("prompt token count:", seq_lens)
+        log.debug("Prompt token counts: %s", seq_lens.tolist())
         return [u[:v] for u, v in zip(context, seq_lens)]
