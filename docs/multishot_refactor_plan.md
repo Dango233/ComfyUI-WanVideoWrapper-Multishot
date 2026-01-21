@@ -191,6 +191,7 @@
 - [x] `wanvideo/modules/model.py` 解析 `shot_attention_cfg`
 - [x] cross-attn mask 逻辑接入 `build_cross_attention_mask()`
 - [x] `shot_embedding` 与 `shot_mask` 拼接逻辑完整
+- [x] `nodes_model_loading.py` 识别 `shot_embedding.weight` 并写入模型配置
 
 **Diff 指向**：
 - `git diff 393fe78..main -- wanvideo/modules/attention.py`
@@ -257,3 +258,4 @@
 - 2026-01-21 Commit 5：`custom_linear.py` 增加 per-shot LoRA 注入与 runtime_context 支持。**Checklist 更新：** `E.custom_linear.py` 完成。
 - 2026-01-21 Commit 6：`wanvideo/modules/attention.py` 新增 sparse shot attention 与 fallback。**Checklist 更新：** `D.attention.py` 完成。
 - 2026-01-21 Commit 7：`wanvideo/modules/model.py` 接入 shot attention、cross-attn mask、shot embedding/mask 与 runtime_context。**Checklist 更新：** `D.model.py` 与 `E.runtime_context` 完成。
+- 2026-01-21 Commit 8：`nodes_model_loading.py` 增加 shot embedding 权重检测并传入模型配置。**Checklist 更新：** `D.nodes_model_loading.py` 完成。

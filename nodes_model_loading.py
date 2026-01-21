@@ -1391,8 +1391,16 @@ class WanVideoModelLoader:
                 model_variant = "i2v_14B_2.2"
             else:
                 model_variant = "14B_2.2"
-
+        
         log.info(f"Model variant detected: {model_variant}")
+
+        shot_embedding_entries = 0
+        use_shot_embedding = False
+        shot_embedding_weight = sd.get("shot_embedding.weight")
+        if shot_embedding_weight is not None:
+            shot_embedding_entries = int(shot_embedding_weight.shape[0])
+            use_shot_embedding = shot_embedding_entries > 0
+            log.info(f"Detected shot embedding weights: {shot_embedding_entries}")
 
         TRANSFORMER_CONFIG= {
             "dim": dim,
@@ -1432,6 +1440,9 @@ class WanVideoModelLoader:
             "lynx_ip_layers": lynx_ip_layers,
             "lynx_ref_layers": lynx_ref_layers,
             "is_longcat": dim == 4096,
+            "max_shots": shot_embedding_entries,
+            "use_shot_embedding": use_shot_embedding,
+            "shot_embedding_init": "zeros",
 
         }
 
@@ -1444,6 +1455,8 @@ class WanVideoModelLoader:
                 "patch_size": [1],
                 "in_dim": 20,
                 "out_dim": 20,
+                "use_shot_embedding": False,
+                "max_shots": 0,
                 })
 
             with init_empty_weights():
