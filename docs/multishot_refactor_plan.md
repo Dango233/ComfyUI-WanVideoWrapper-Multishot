@@ -187,7 +187,7 @@
 ---
 
 ### D. 模型层 shot attention + cross-attn mask
-- [ ] `wanvideo/modules/attention.py` 加入 `sparse_shot_attention` + fallback
+- [x] `wanvideo/modules/attention.py` 加入 `sparse_shot_attention` + fallback
 - [ ] `wanvideo/modules/model.py` 解析 `shot_attention_cfg`
 - [ ] cross-attn mask 逻辑接入 `build_cross_attention_mask()`
 - [ ] `shot_embedding` 与 `shot_mask` 拼接逻辑完整
@@ -255,3 +255,4 @@
 - 2026-01-21 Commit 3：`tokenizers.py` 增加 fast->slow fallback，`t5.py` 统一日志输出。**Checklist 更新：** `F. Tokenizer 兼容与日志` 完成。
 - 2026-01-21 Commit 4：新增 Holocine 节点与结构化 prompt 流程，`WanVideoTextEncode` 输出 `text_cut_positions`。**Checklist 更新：** `B. 节点：Holocine Shot / Prompt / SetShotAttention` 完成。
 - 2026-01-21 Commit 5：`custom_linear.py` 增加 per-shot LoRA 注入与 runtime_context 支持。**Checklist 更新：** `E.custom_linear.py` 完成。
+- 2026-01-21 Commit 6：`wanvideo/modules/attention.py` 新增 sparse shot attention 与 fallback。**Checklist 更新：** `D.attention.py` 完成。
