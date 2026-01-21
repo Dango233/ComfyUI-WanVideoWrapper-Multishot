@@ -300,10 +300,16 @@ def sparse_shot_attention(
         if smooth_values:
             limit = min(len(smooth_values), num_shots - 1)
             for sid in range(limit):
-                if smooth_values[sid] <= 0 or sid + 1 >= num_shots:
+                window = smooth_values[sid]
+                if window <= 0 or sid + 1 >= num_shots:
                     continue
-                overlap_next[sid] = k_locals[sid + 1].size(0)
-                overlap_prev[sid + 1] = k_locals[sid].size(0)
+                cur_len = k_locals[sid].size(0)
+                next_len = k_locals[sid + 1].size(0)
+                share_len = min(int(window), cur_len, next_len)
+                if share_len <= 0:
+                    continue
+                overlap_next[sid] = share_len
+                overlap_prev[sid + 1] = share_len
 
         for shot_idx, (k_local, v_local) in enumerate(zip(k_locals, v_locals)):
             parts_k = [k_local]
@@ -413,10 +419,16 @@ def _sparse_shot_attention_fallback(
         if smooth_windows:
             limit = min(len(smooth_windows), num_shots - 1)
             for sid in range(limit):
-                if smooth_windows[sid] <= 0 or sid + 1 >= num_shots:
+                window = smooth_windows[sid]
+                if window <= 0 or sid + 1 >= num_shots:
                     continue
-                overlap_next[sid] = k_locals[sid + 1].size(0)
-                overlap_prev[sid + 1] = k_locals[sid].size(0)
+                cur_len = k_locals[sid].size(0)
+                next_len = k_locals[sid + 1].size(0)
+                share_len = min(int(window), cur_len, next_len)
+                if share_len <= 0:
+                    continue
+                overlap_next[sid] = share_len
+                overlap_prev[sid + 1] = share_len
 
         for shot_idx, (k_local, v_local, q_local) in enumerate(zip(k_locals, v_locals, q_locals)):
             parts_k = [k_local]
