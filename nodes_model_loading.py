@@ -10,13 +10,14 @@ from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
-from .custom_linear import _replace_linear
+from .custom_linear import _replace_linear, set_shot_lora_params
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
 
 import folder_paths
 import comfy.model_management as mm
+from comfy.patcher_extension import CallbacksMP
 from comfy.utils import load_torch_file, ProgressBar
 import comfy.model_base
 from comfy.sd import load_lora_for_models
@@ -1716,6 +1717,20 @@ class WanVideoModelLoader:
         comfy_model.load_device = transformer_load_device
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
         patcher.model.is_patched = False
+
+        def _clear_shot_lora_on_detach(model_patcher, unpatch_all):
+            try:
+                transformer_mod = model_patcher.model.diffusion_model
+            except Exception:
+                return
+            try:
+                set_shot_lora_params(transformer_mod, {})
+                if hasattr(transformer_mod, "shot_lora_count"):
+                    transformer_mod.shot_lora_count = 0
+            except Exception as exc:
+                log.warning(f"Failed to clear per-shot LoRA on detach: {exc}")
+
+        patcher.add_callback(CallbacksMP.ON_DETACH, _clear_shot_lora_on_detach)
 
         scale_weights = {}
         if "fp8" in quantization:
