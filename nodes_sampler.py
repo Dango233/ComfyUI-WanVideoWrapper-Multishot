@@ -80,6 +80,28 @@ def prepare_shot_lora_payload(base_model, shot_lora_specs):
                 else:
                     mapped_key = raw_key[0]
 
+                if isinstance(patch_value, tuple) and len(patch_value) > 0:
+                    tag = patch_value[0]
+                    if tag == "diff":
+                        diff_payload = patch_value[1] if len(patch_value) > 1 else None
+                        diff_tensor = None
+                        if isinstance(diff_payload, (list, tuple)) and len(diff_payload) > 0:
+                            diff_tensor = diff_payload[0]
+                        elif isinstance(diff_payload, torch.Tensor):
+                            diff_tensor = diff_payload
+                        if isinstance(diff_tensor, torch.Tensor):
+                            diff_cpu = diff_tensor.to(torch.float32).cpu().contiguous()
+                            component = {
+                                "strength": strength_value,
+                                "diff": diff_cpu,
+                            }
+                            shot_patch.setdefault(mapped_key, []).append(component)
+                        else:
+                            log.warning(
+                                f"Shot LoRA diff entry {mapped_key} is missing a tensor payload and will be skipped."
+                            )
+                        continue
+
                 weights_tuple = getattr(patch_value, "weights", None)
                 if (
                     not isinstance(weights_tuple, tuple)
@@ -101,9 +123,8 @@ def prepare_shot_lora_payload(base_model, shot_lora_specs):
 
                 if mid_entry is not None or dora_entry is not None or (reshape_entry not in (None, [])):
                     log.warning(
-                        f"Shot LoRA entry {mapped_key} requires non-linear adapter features and will be skipped in per-shot mode."
+                        f"Shot LoRA entry {mapped_key} includes mid/DoRA/reshape weights; per-shot LoRA will ignore those extras to match base behavior."
                     )
-                    continue
 
                 if up_tensor.ndim != 2 or down_tensor.ndim != 2:
                     log.warning(

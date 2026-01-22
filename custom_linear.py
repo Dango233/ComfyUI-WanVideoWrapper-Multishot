@@ -318,6 +318,27 @@ class CustomLinear(nn.Linear):
                 if strength_value == 0.0:
                     continue
 
+                diff_weight = component.get("diff")
+                if diff_weight is not None:
+                    if isinstance(diff_weight, torch.Tensor):
+                        diff_weight = diff_weight.to(device=device, dtype=dtype, non_blocking=True)
+                    else:
+                        continue
+                    if diff_weight.ndim != 2:
+                        continue
+                    in_dim = shot_input.shape[1]
+                    out_dim = flat_output.shape[1]
+                    if diff_weight.shape[0] == out_dim and diff_weight.shape[1] == in_dim:
+                        diff_for_mul = diff_weight
+                    elif diff_weight.shape[0] == in_dim and diff_weight.shape[1] == out_dim:
+                        diff_for_mul = diff_weight.transpose(0, 1)
+                    else:
+                        continue
+                    contribution = torch.matmul(shot_input, diff_for_mul.transpose(0, 1))
+                    contribution = contribution * strength_value
+                    shot_delta = contribution if shot_delta is None else (shot_delta + contribution)
+                    continue
+
                 up_weight = component.get("up")
                 down_weight = component.get("down")
                 if up_weight is None or down_weight is None:
