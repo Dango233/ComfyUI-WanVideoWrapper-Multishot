@@ -10,7 +10,7 @@ from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
-from .custom_linear import _replace_linear, set_shot_lora_params
+from .custom_linear import _replace_linear, set_shot_lora_params, remove_shot_lora_from_module
 
 from accelerate import init_empty_weights
 from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
@@ -1724,6 +1724,7 @@ class WanVideoModelLoader:
             except Exception:
                 return
             try:
+                remove_shot_lora_from_module(transformer_mod)
                 set_shot_lora_params(transformer_mod, {})
                 if hasattr(transformer_mod, "shot_lora_count"):
                     transformer_mod.shot_lora_count = 0

@@ -160,11 +160,19 @@ class CustomLinear(nn.Linear):
             self._linear_forward_impl = self._linear_forward_direct
 
     def clear_shot_lora_cache(self):
+        buffer_names = []
         if hasattr(self, "_shot_lora_buffer_names"):
-            for name in list(self._shot_lora_buffer_names):
-                if hasattr(self, name):
-                    delattr(self, name)
-            self._shot_lora_buffer_names = []
+            buffer_names.extend(list(self._shot_lora_buffer_names))
+        if hasattr(self, "_buffers"):
+            for name in list(self._buffers.keys()):
+                if name.startswith("_shot_lora_") and name not in buffer_names:
+                    buffer_names.append(name)
+        for name in buffer_names:
+            if hasattr(self, name):
+                delattr(self, name)
+            elif hasattr(self, "_buffers") and name in self._buffers:
+                del self._buffers[name]
+        self._shot_lora_buffer_names = []
         self.shot_lora = []
         self.shot_lora_key = None
 
@@ -416,10 +424,15 @@ def update_lora_step(module, step):
         if isinstance(submodule, CustomLinear) and hasattr(submodule, "_step"):
             submodule._step.fill_(step)
 
-def remove_lora_from_module(module):
+def remove_shot_lora_from_module(module):
     for name, submodule in module.named_modules():
         if isinstance(submodule, CustomLinear):
             submodule.clear_shot_lora_cache()
+
+
+def remove_lora_from_module(module):
+    remove_shot_lora_from_module(module)
+    for name, submodule in module.named_modules():
         if hasattr(submodule, "lora_diffs"):
             for i in range(len(submodule.lora_diffs)):
                 if hasattr(submodule, f"lora_diff_{i}_0"):
