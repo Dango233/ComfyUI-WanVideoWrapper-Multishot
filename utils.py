@@ -85,6 +85,41 @@ def offload_transformer(transformer, remove_lora=True):
     gc.collect()
 
 
+def hard_offload_transformer(transformer, remove_lora=True):
+    """Force-release GPU memory even if the model stays referenced in node cache."""
+    transformer.teacache_state.clear_all()
+    transformer.magcache_state.clear_all()
+    transformer.easycache_state.clear_all()
+
+    for name, param in transformer.named_parameters():
+        if "loras" in name or "controlnet" in name:
+            continue
+        module = transformer
+        subnames = name.split('.')
+        for subname in subnames[:-1]:
+            module = getattr(module, subname)
+        attr_name = subnames[-1]
+        if param.data.is_floating_point():
+            meta_param = torch.nn.Parameter(torch.empty_like(param.data, device='meta'), requires_grad=False)
+            setattr(module, attr_name, meta_param)
+        elif isinstance(param.data, GGUFParameter):
+            quant_type = getattr(param, 'quant_type', None)
+            setattr(module, attr_name, MetaParameter(param.data.dtype, quant_type))
+        else:
+            pass
+
+    if remove_lora:
+        remove_lora_from_module(transformer)
+
+    for block in transformer.blocks:
+        block.kv_cache = None
+        if transformer.audio_model is not None and hasattr(block, 'audio_block'):
+            block.audio_block = None
+
+    mm.soft_empty_cache()
+    gc.collect()
+
+
 def init_blockswap(transformer, block_swap_args, model):
     if not transformer.patched_linear:
         if block_swap_args is not None:

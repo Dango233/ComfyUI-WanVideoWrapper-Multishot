@@ -10,7 +10,8 @@ from .wanvideo.schedulers import get_scheduler, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
 from .multitalk.multitalk import add_noise
 from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
-                   compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling, offload_transformer, init_blockswap)
+                   compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling,
+                   offload_transformer, hard_offload_transformer, init_blockswap)
 from .multitalk.multitalk_loop import multitalk_loop
 from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights, standardize_lora_key_format, filter_state_dict_by_blocks, model_lora_keys_unet
@@ -2831,7 +2832,7 @@ class WanVideoSampler:
                 if shot_lora_payload:
                     assign_shot_lora_to_transformer(transformer, [])
                 if force_offload and not model["auto_cpu_offload"]:
-                    offload_transformer(transformer)
+                    hard_offload_transformer(transformer)
                 raise e
 
         if phantom_latents is not None:
@@ -2859,7 +2860,7 @@ class WanVideoSampler:
         if shot_lora_payload:
             assign_shot_lora_to_transformer(transformer, [])
         if force_offload and not model["auto_cpu_offload"]:
-            offload_transformer(transformer)
+            hard_offload_transformer(transformer)
 
         try:
             print_memory(device)
