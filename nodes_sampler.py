@@ -2829,6 +2829,8 @@ class WanVideoSampler:
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
                 if force_offload:
+                    if shot_lora_payload:
+                        assign_shot_lora_to_transformer(transformer, [])
                     if not model["auto_cpu_offload"]:
                         offload_transformer(transformer)
                 raise e
@@ -2856,6 +2858,8 @@ class WanVideoSampler:
                 }
 
         if force_offload:
+            if shot_lora_payload:
+                assign_shot_lora_to_transformer(transformer, [])
             if not model["auto_cpu_offload"]:
                 offload_transformer(transformer)
 
