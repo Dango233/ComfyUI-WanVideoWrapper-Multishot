@@ -95,6 +95,8 @@ def set_lora_params(module, patches, module_prefix="", device=torch.device("cpu"
             device = params[0].device
         else:
             device = torch.device("cpu")
+        if device.type == "meta":
+            device = torch.device("cpu")
         child_prefix = (f"{module_prefix}{name}.")
         set_lora_params(child, patches, child_prefix, device)
     if isinstance(module, CustomLinear):
@@ -146,6 +148,7 @@ class CustomLinear(nn.Linear):
         self.is_gguf = is_gguf
         self.shot_lora = []
         self.shot_lora_key = None
+        self._shot_lora_buffer_names = []
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -157,7 +160,13 @@ class CustomLinear(nn.Linear):
             self._linear_forward_impl = self._linear_forward_direct
 
     def clear_shot_lora_cache(self):
-        return
+        if hasattr(self, "_shot_lora_buffer_names"):
+            for name in list(self._shot_lora_buffer_names):
+                if hasattr(self, name):
+                    delattr(self, name)
+            self._shot_lora_buffer_names = []
+        self.shot_lora = []
+        self.shot_lora_key = None
 
 
     # Direct implementations (no custom ops)
@@ -293,6 +302,19 @@ class CustomLinear(nn.Linear):
         device = flat_input.device
         dtype = flat_input.dtype
         current_step = ctx.get("current_step", 0)
+
+        def _resolve_shot_tensor(value):
+            if isinstance(value, str):
+                if hasattr(self, value):
+                    value = getattr(self, value)
+                else:
+                    return None
+            if isinstance(value, torch.Tensor):
+                if value.device != device or value.dtype != dtype:
+                    value = value.to(device=device, dtype=dtype, non_blocking=True)
+                return value
+            return None
+
         for shot_idx, components in enumerate(self.shot_lora):
             if not components:
                 continue
@@ -320,9 +342,8 @@ class CustomLinear(nn.Linear):
 
                 diff_weight = component.get("diff")
                 if diff_weight is not None:
-                    if isinstance(diff_weight, torch.Tensor):
-                        diff_weight = diff_weight.to(device=device, dtype=dtype, non_blocking=True)
-                    else:
+                    diff_weight = _resolve_shot_tensor(diff_weight)
+                    if diff_weight is None:
                         continue
                     if diff_weight.ndim != 2:
                         continue
@@ -341,11 +362,10 @@ class CustomLinear(nn.Linear):
 
                 up_weight = component.get("up")
                 down_weight = component.get("down")
+                up_weight = _resolve_shot_tensor(up_weight)
+                down_weight = _resolve_shot_tensor(down_weight)
                 if up_weight is None or down_weight is None:
                     continue
-
-                up_weight = up_weight.to(device=device, dtype=dtype, non_blocking=True)
-                down_weight = down_weight.to(device=device, dtype=dtype, non_blocking=True)
 
                 if up_weight.ndim != 2 or down_weight.ndim != 2:
                     continue
@@ -410,10 +430,15 @@ def remove_lora_from_module(module):
                     delattr(submodule, f"lora_diff_{i}_2")
 
 
-def set_shot_lora_params(module, shot_payload, module_prefix=""):
+def set_shot_lora_params(module, shot_payload, module_prefix="", device=torch.device("cpu")):
     for name, child in module.named_children():
+        params = list(child.parameters())
+        if params:
+            device = params[0].device
+        else:
+            device = torch.device("cpu")
         child_prefix = f"{module_prefix}{name}."
-        set_shot_lora_params(child, shot_payload, child_prefix)
+        set_shot_lora_params(child, shot_payload, child_prefix, device)
 
     if isinstance(module, CustomLinear):
         module.clear_shot_lora_cache()
@@ -427,5 +452,47 @@ def set_shot_lora_params(module, shot_payload, module_prefix=""):
             module.shot_lora = []
             module.shot_lora_key = key
         else:
-            module.shot_lora = [components if components is not None else [] for components in shot_components]
+            buffer_names = []
+            processed = []
+            dtype = module.compute_dtype if module.compute_dtype is not None else None
+            for shot_idx, components in enumerate(shot_components):
+                if not components:
+                    processed.append([])
+                    continue
+                shot_list = []
+                for comp_idx, component in enumerate(components):
+                    if not isinstance(component, dict):
+                        continue
+                    new_comp = {}
+                    if "strength" in component:
+                        new_comp["strength"] = component.get("strength")
+                    if "alpha" in component:
+                        new_comp["alpha"] = component.get("alpha")
+                    if "rank" in component:
+                        new_comp["rank"] = component.get("rank")
+
+                    diff_weight = component.get("diff")
+                    if isinstance(diff_weight, torch.Tensor):
+                        name = f"_shot_lora_{shot_idx}_{comp_idx}_diff"
+                        module.register_buffer(name, diff_weight.to(device=device, dtype=dtype), persistent=False)
+                        buffer_names.append(name)
+                        new_comp["diff"] = name
+
+                    up_weight = component.get("up")
+                    down_weight = component.get("down")
+                    if isinstance(up_weight, torch.Tensor) and isinstance(down_weight, torch.Tensor):
+                        up_name = f"_shot_lora_{shot_idx}_{comp_idx}_up"
+                        down_name = f"_shot_lora_{shot_idx}_{comp_idx}_down"
+                        module.register_buffer(up_name, up_weight.to(device=device, dtype=dtype), persistent=False)
+                        module.register_buffer(down_name, down_weight.to(device=device, dtype=dtype), persistent=False)
+                        buffer_names.extend([up_name, down_name])
+                        new_comp["up"] = up_name
+                        new_comp["down"] = down_name
+
+                    if new_comp:
+                        shot_list.append(new_comp)
+                processed.append(shot_list)
+
+            module._shot_lora_buffer_names = buffer_names
+            module.shot_lora = processed
             module.shot_lora_key = key

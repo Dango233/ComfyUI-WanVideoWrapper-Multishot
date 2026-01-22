@@ -278,7 +278,6 @@ class WanVideoSampler:
             shot_lora_payload = prepare_shot_lora_payload(patcher.model, shot_lora_specs)
             if all(len(entry) == 0 for entry in shot_lora_payload):
                 shot_lora_payload = []
-        assign_shot_lora_to_transformer(transformer, shot_lora_payload)
 
         block_swap_args = transformer_options.get("block_swap_args", None)
         if block_swap_args is not None:
@@ -318,6 +317,8 @@ class WanVideoSampler:
             set_lora_params(transformer, patcher.patches)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
+
+        assign_shot_lora_to_transformer(transformer, shot_lora_payload)
 
         transformer.lora_scheduling_enabled = transformer_options.get("lora_scheduling_enabled", False)
 
