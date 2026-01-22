@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import os, gc, uuid
-from .utils import log, apply_lora
+from .utils import log, apply_lora, offload_transformer
 import numpy as np
 from tqdm import tqdm
 import re
@@ -1729,6 +1729,12 @@ class WanVideoModelLoader:
                     transformer_mod.shot_lora_count = 0
             except Exception as exc:
                 log.warning(f"Failed to clear per-shot LoRA: {exc}")
+                return
+
+            try:
+                offload_transformer(transformer_mod, remove_lora=True)
+            except Exception as exc:
+                log.warning(f"Failed to offload transformer during per-shot cleanup: {exc}")
 
         patcher.add_callback(CallbacksMP.ON_DETACH, _clear_shot_lora)
         patcher.add_callback(CallbacksMP.ON_EJECT_MODEL, _clear_shot_lora)
