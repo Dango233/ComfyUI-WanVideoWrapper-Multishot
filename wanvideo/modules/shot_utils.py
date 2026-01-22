@@ -108,20 +108,21 @@ def _find_shot_char_spans(prompt: str) -> Dict[str, Optional[List[Tuple[int, int
     }
 
     if global_idx != -1:
-        global_start = global_idx + len(SHOT_GLOBAL_TAG)
+        global_start = global_idx
         global_end = per_idx if per_idx != -1 else len(prompt)
         spans["global"] = [(global_start, global_end)]
 
     if per_idx != -1:
         shots: List[Tuple[int, int]] = []
-        cursor = per_idx + len(SHOT_PER_TAG)
+        cursor = per_idx
         while cursor < len(prompt):
             next_cut = prompt.find(SHOT_CUT_TAG, cursor)
             if next_cut == -1:
                 shots.append((cursor, len(prompt)))
                 break
-            shots.append((cursor, next_cut))
-            cursor = next_cut + len(SHOT_CUT_TAG)
+            cut_end = next_cut + len(SHOT_CUT_TAG)
+            shots.append((cursor, cut_end))
+            cursor = cut_end
         spans["shots"] = shots
 
     return spans

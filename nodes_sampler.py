@@ -2829,9 +2829,9 @@ class WanVideoSampler:
 
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
-                if shot_lora_payload:
-                    assign_shot_lora_to_transformer(transformer, [])
-                if force_offload and not model["auto_cpu_offload"]:
+                # Always clear per-shot LoRA buffers to avoid VRAM residue on failures.
+                assign_shot_lora_to_transformer(transformer, [])
+                if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                     hard_offload_transformer(transformer)
                 raise e
 
@@ -2857,9 +2857,9 @@ class WanVideoSampler:
                     "magcache_state": transformer.magcache_state,
                 }
 
-        if shot_lora_payload:
-            assign_shot_lora_to_transformer(transformer, [])
-        if force_offload and not model["auto_cpu_offload"]:
+        # Always clear per-shot LoRA buffers to avoid VRAM residue.
+        assign_shot_lora_to_transformer(transformer, [])
+        if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
             hard_offload_transformer(transformer)
 
         try:
