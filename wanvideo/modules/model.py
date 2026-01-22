@@ -3103,7 +3103,7 @@ class WanModel(torch.nn.Module):
                     smooth_windows=smooth_windows,
                 )
             except Exception as exc:
-                raise ValueError(f\"Failed to build cross-attention mask for shot attention: {exc}\") from exc
+                raise ValueError(f"Failed to build cross-attention mask for shot attention: {exc}") from exc
 
         # dual control
         if dual_control_input is not None and dual_control_input["start_percent"] <= current_step_percentage <= dual_control_input["end_percent"]:
