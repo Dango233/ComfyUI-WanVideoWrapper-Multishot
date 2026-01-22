@@ -1718,7 +1718,7 @@ class WanVideoModelLoader:
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, offload_device)
         patcher.model.is_patched = False
 
-        def _clear_shot_lora_on_detach(model_patcher, unpatch_all):
+        def _clear_shot_lora(model_patcher, _unused=None):
             try:
                 transformer_mod = model_patcher.model.diffusion_model
             except Exception:
@@ -1728,9 +1728,11 @@ class WanVideoModelLoader:
                 if hasattr(transformer_mod, "shot_lora_count"):
                     transformer_mod.shot_lora_count = 0
             except Exception as exc:
-                log.warning(f"Failed to clear per-shot LoRA on detach: {exc}")
+                log.warning(f"Failed to clear per-shot LoRA: {exc}")
 
-        patcher.add_callback(CallbacksMP.ON_DETACH, _clear_shot_lora_on_detach)
+        patcher.add_callback(CallbacksMP.ON_DETACH, _clear_shot_lora)
+        patcher.add_callback(CallbacksMP.ON_EJECT_MODEL, _clear_shot_lora)
+        patcher.add_callback(CallbacksMP.ON_CLEANUP, _clear_shot_lora)
 
         scale_weights = {}
         if "fp8" in quantization:

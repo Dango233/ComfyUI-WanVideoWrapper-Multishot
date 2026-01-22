@@ -2828,11 +2828,10 @@ class WanVideoSampler:
 
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
-                if force_offload:
-                    if shot_lora_payload:
-                        assign_shot_lora_to_transformer(transformer, [])
-                    if not model["auto_cpu_offload"]:
-                        offload_transformer(transformer)
+                if shot_lora_payload:
+                    assign_shot_lora_to_transformer(transformer, [])
+                if force_offload and not model["auto_cpu_offload"]:
+                    offload_transformer(transformer)
                 raise e
 
         if phantom_latents is not None:
@@ -2857,11 +2856,10 @@ class WanVideoSampler:
                     "magcache_state": transformer.magcache_state,
                 }
 
-        if force_offload:
-            if shot_lora_payload:
-                assign_shot_lora_to_transformer(transformer, [])
-            if not model["auto_cpu_offload"]:
-                offload_transformer(transformer)
+        if shot_lora_payload:
+            assign_shot_lora_to_transformer(transformer, [])
+        if force_offload and not model["auto_cpu_offload"]:
+            offload_transformer(transformer)
 
         try:
             print_memory(device)
