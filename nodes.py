@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import hashlib
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
+from .custom_linear import remove_shot_lora_from_module
 from .taehv import TAEHV
 from .wanvideo.modules.shot_utils import enforce_4t_plus_1, parse_shot_cut_string, parse_structured_prompt
 
@@ -628,6 +629,8 @@ class WanVideoTextEncode:
 
         if model_to_offload is not None and device == "gpu":
             try:
+                if hasattr(model_to_offload, "model") and hasattr(model_to_offload.model, "diffusion_model"):
+                    remove_shot_lora_from_module(model_to_offload.model.diffusion_model)
                 log.info(f"Moving video model to {offload_device}")
                 model_to_offload.model.to(offload_device)
             except:

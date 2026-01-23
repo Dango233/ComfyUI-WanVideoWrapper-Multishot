@@ -428,6 +428,7 @@ def remove_shot_lora_from_module(module):
     for name, submodule in module.named_modules():
         if isinstance(submodule, CustomLinear):
             submodule.clear_shot_lora_cache()
+    CustomLinear.runtime_context = None
 
 
 def remove_lora_from_module(module):
