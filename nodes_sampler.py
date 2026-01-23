@@ -2422,6 +2422,10 @@ class WanVideoSampler:
                         if force_offload:
                             if not model["auto_cpu_offload"]:
                                 offload_transformer(transformer)
+                        # Always clear per-shot LoRA buffers to avoid VRAM residue.
+                        assign_shot_lora_to_transformer(transformer, [])
+                        if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
+                            hard_offload_transformer(transformer)
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2716,6 +2720,10 @@ class WanVideoSampler:
                             vae.to(offload_device)
                             if not model["auto_cpu_offload"]:
                                 offload_transformer(transformer)
+                        # Always clear per-shot LoRA buffers to avoid VRAM residue.
+                        assign_shot_lora_to_transformer(transformer, [])
+                        if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
+                            hard_offload_transformer(transformer)
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
