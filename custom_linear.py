@@ -424,16 +424,60 @@ def update_lora_step(module, step):
         if isinstance(submodule, CustomLinear) and hasattr(submodule, "_step"):
             submodule._step.fill_(step)
 
+def _iter_modules_with_wrappers(root):
+    """Iterate modules, following common wrapper attributes like _orig_mod / module."""
+    seen = set()
+    stack = [root]
+    while stack:
+        module = stack.pop()
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        yield module
+        try:
+            children = list(module.children())
+        except Exception:
+            children = []
+        for child in children:
+            if isinstance(child, nn.Module):
+                stack.append(child)
+        for attr in ("_orig_mod", "module"):
+            try:
+                wrapped = getattr(module, attr, None)
+            except Exception:
+                wrapped = None
+            if isinstance(wrapped, nn.Module):
+                stack.append(wrapped)
+
+
+def _clear_shot_lora_buffers(module):
+    if isinstance(module, CustomLinear):
+        module.clear_shot_lora_cache()
+        return
+    # Fallback cleanup for wrapped modules that may not be CustomLinear
+    if hasattr(module, "_buffers"):
+        for name in list(module._buffers.keys()):
+            if name.startswith("_shot_lora_"):
+                del module._buffers[name]
+    if hasattr(module, "_shot_lora_buffer_names"):
+        module._shot_lora_buffer_names = []
+    if hasattr(module, "shot_lora"):
+        module.shot_lora = []
+    if hasattr(module, "shot_lora_key"):
+        module.shot_lora_key = None
+    if hasattr(module, "shot_lora_count"):
+        module.shot_lora_count = 0
+
+
 def remove_shot_lora_from_module(module):
-    for name, submodule in module.named_modules():
-        if isinstance(submodule, CustomLinear):
-            submodule.clear_shot_lora_cache()
+    for submodule in _iter_modules_with_wrappers(module):
+        _clear_shot_lora_buffers(submodule)
     CustomLinear.runtime_context = None
 
 
 def remove_lora_from_module(module):
     remove_shot_lora_from_module(module)
-    for name, submodule in module.named_modules():
+    for submodule in _iter_modules_with_wrappers(module):
         if hasattr(submodule, "lora_diffs"):
             for i in range(len(submodule.lora_diffs)):
                 if hasattr(submodule, f"lora_diff_{i}_0"):
@@ -442,6 +486,15 @@ def remove_lora_from_module(module):
                     delattr(submodule, f"lora_diff_{i}_1")
                 if hasattr(submodule, f"lora_diff_{i}_2"):
                     delattr(submodule, f"lora_diff_{i}_2")
+        # Also clear scheduled strength buffers to avoid lingering refs
+        if hasattr(submodule, "_buffers"):
+            for name in list(submodule._buffers.keys()):
+                if name.startswith("_lora_strength_"):
+                    del submodule._buffers[name]
+        if hasattr(submodule, "_lora_strength_tensors"):
+            submodule._lora_strength_tensors = []
+        if hasattr(submodule, "_lora_strength_is_scheduled"):
+            submodule._lora_strength_is_scheduled = []
 
 
 def set_shot_lora_params(module, shot_payload, module_prefix="", device=torch.device("cpu")):
