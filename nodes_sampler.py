@@ -2835,7 +2835,7 @@ class WanVideoSampler:
                     else:
                         pbar.update(1)
 
-            except Exception as e:
+            except BaseException as e:
                 log.error(f"Error during sampling: {e}")
                 # Always clear per-shot LoRA buffers to avoid VRAM residue on failures.
                 assign_shot_lora_to_transformer(transformer, [])
