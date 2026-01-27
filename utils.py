@@ -337,6 +337,62 @@ def _ensure_execution_hook(execution):
     execution._wanvideo_executor_hooked = True
 
 
+def _snapshot_from_cache_sources(cache_sources, max_depth):
+    snapshot = {}
+    for source_name, cache_obj in cache_sources:
+        entries = _collect_cache_entries(cache_obj)
+        entry_bytes = {}
+        total_bytes = 0
+        for key, value in entries:
+            bytes_now = _cuda_tensor_bytes(value, set(), 0, max_depth)
+            if bytes_now > 0:
+                entry_bytes[key] = bytes_now
+                total_bytes += bytes_now
+        snapshot[source_name] = {
+            "total": total_bytes,
+            "entries": entry_bytes,
+        }
+    return snapshot
+
+
+def _snapshot_node_cache_for_executor(executor, max_depth=6):
+    if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
+        return None
+    if executor is None or not hasattr(executor, "caches"):
+        return None
+    cache_sources = []
+    for cache_name in ("outputs", "ui", "objects"):
+        cache_obj = getattr(executor.caches, cache_name, None)
+        if cache_obj is not None:
+            cache_sources.append((f"PromptExecutor.caches.{cache_name}", cache_obj))
+    if not cache_sources:
+        return None
+    return _snapshot_from_cache_sources(cache_sources, max_depth)
+
+
+def _ensure_prompt_executor_reset_hook(execution):
+    if getattr(execution, "_wanvideo_reset_hooked", False):
+        return
+    PromptExecutor = getattr(execution, "PromptExecutor", None)
+    if PromptExecutor is None:
+        return
+    original_reset = getattr(PromptExecutor, "reset", None)
+    if original_reset is None:
+        return
+
+    def _wrapped_reset(self, *args, **kwargs):
+        if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
+            return original_reset(self, *args, **kwargs)
+        before = _snapshot_node_cache_for_executor(self)
+        result = original_reset(self, *args, **kwargs)
+        after = _snapshot_node_cache_for_executor(self)
+        report_node_cache_cuda_delta(before, after, tag="prompt_executor_reset")
+        return result
+
+    PromptExecutor.reset = _wrapped_reset
+    execution._wanvideo_reset_hooked = True
+
+
 def _find_prompt_executor_instances(execution):
     PromptExecutor = getattr(execution, "PromptExecutor", None)
     if PromptExecutor is None:
@@ -368,6 +424,7 @@ def _get_execution_module():
 def _collect_node_cache_sources(execution):
     cache_sources = []
     _ensure_execution_hook(execution)
+    _ensure_prompt_executor_reset_hook(execution)
 
     executor_ref = getattr(execution, "_wanvideo_executor_ref", None)
     if executor_ref is not None:
@@ -417,21 +474,7 @@ def snapshot_node_cache_cuda_usage(max_depth=6):
         log.info("[NodeCache] no cache sources found")
         return {}
 
-    snapshot = {}
-    for source_name, cache_obj in cache_sources:
-        entries = _collect_cache_entries(cache_obj)
-        entry_bytes = {}
-        total_bytes = 0
-        for key, value in entries:
-            bytes_now = _cuda_tensor_bytes(value, set(), 0, max_depth)
-            if bytes_now > 0:
-                entry_bytes[key] = bytes_now
-                total_bytes += bytes_now
-        snapshot[source_name] = {
-            "total": total_bytes,
-            "entries": entry_bytes,
-        }
-    return snapshot
+    return _snapshot_from_cache_sources(cache_sources, max_depth)
 
 
 def report_node_cache_cuda_delta(before, after, tag="", max_items=10):
@@ -518,6 +561,13 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
                 f"{bytes_now / (1024 ** 2):.2f} MB"
             )
     return True
+
+
+if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes"):
+    _exec_mod = _get_execution_module()
+    if _exec_mod is not None:
+        _ensure_execution_hook(_exec_mod)
+        _ensure_prompt_executor_reset_hook(_exec_mod)
 
 def get_module_memory_mb(module):
     memory = 0
