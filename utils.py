@@ -381,12 +381,17 @@ def _ensure_prompt_executor_reset_hook(execution):
         return
 
     def _wrapped_reset(self, *args, **kwargs):
-        if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
-            return original_reset(self, *args, **kwargs)
-        before = _snapshot_node_cache_for_executor(self)
+        node_debug = os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes")
+        mem_debug = os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
+        before_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
+        before_mem = _cuda_mem_snapshot() if mem_debug else None
         result = original_reset(self, *args, **kwargs)
-        after = _snapshot_node_cache_for_executor(self)
-        report_node_cache_cuda_delta(before, after, tag="prompt_executor_reset")
+        after_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
+        after_mem = _cuda_mem_snapshot() if mem_debug else None
+        if node_debug:
+            report_node_cache_cuda_delta(before_cache, after_cache, tag="prompt_executor_reset")
+        if mem_debug:
+            report_cuda_mem_delta(before_mem, after_mem, tag="prompt_executor_reset")
         return result
 
     PromptExecutor.reset = _wrapped_reset
@@ -563,11 +568,65 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
     return True
 
 
-if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes"):
+def _cuda_mem_snapshot(device=None):
+    if not torch.cuda.is_available():
+        return None
+    if device is None:
+        try:
+            device = mm.get_torch_device()
+        except Exception:
+            device = torch.device("cuda")
+    try:
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+    except Exception:
+        return None
+    return {"device": str(device), "allocated": allocated, "reserved": reserved}
+
+
+def report_cuda_mem_delta(before, after, tag="", min_delta_mb=32):
+    if before is None or after is None:
+        return None
+    alloc_delta = after["allocated"] - before["allocated"]
+    reserv_delta = after["reserved"] - before["reserved"]
+    if abs(alloc_delta) < min_delta_mb * 1024 * 1024 and abs(reserv_delta) < min_delta_mb * 1024 * 1024:
+        return None
+    log.info(
+        f"[CUDA] {tag} {before['device']} "
+        f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
+        f"(delta {alloc_delta / (1024 ** 3):.3f} GB) "
+        f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
+        f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
+    )
+    return True
+
+
+def _ensure_soft_empty_cache_hook():
+    if getattr(mm, "_wanvideo_soft_cache_hooked", False):
+        return
+    original = getattr(mm, "soft_empty_cache", None)
+    if original is None:
+        return
+
+    def _wrapped_soft_empty_cache(*args, **kwargs):
+        mem_debug = os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
+        before = _cuda_mem_snapshot() if mem_debug else None
+        result = original(*args, **kwargs)
+        after = _cuda_mem_snapshot() if mem_debug else None
+        if mem_debug:
+            report_cuda_mem_delta(before, after, tag="soft_empty_cache")
+        return result
+
+    mm.soft_empty_cache = _wrapped_soft_empty_cache
+    mm._wanvideo_soft_cache_hooked = True
+
+
+if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes") or os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes"):
     _exec_mod = _get_execution_module()
     if _exec_mod is not None:
         _ensure_execution_hook(_exec_mod)
         _ensure_prompt_executor_reset_hook(_exec_mod)
+    _ensure_soft_empty_cache_hook()
 
 def get_module_memory_mb(module):
     memory = 0
