@@ -351,11 +351,7 @@ def _find_prompt_executor_instances(execution):
     return instances
 
 
-def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
-    """Best-effort scan of ComfyUI node cache for CUDA tensor usage."""
-    if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
-        return None
-
+def _get_execution_module():
     execution = None
     try:
         import execution as _execution
@@ -364,13 +360,15 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
         try:
             import comfy.execution as _execution
             execution = _execution
-        except Exception as exc:
-            log.warning(f"[NodeCache] {tag} execution module not available: {exc}")
-            return None
+        except Exception:
+            execution = None
+    return execution
 
+
+def _collect_node_cache_sources(execution):
+    cache_sources = []
     _ensure_execution_hook(execution)
 
-    cache_sources = []
     executor_ref = getattr(execution, "_wanvideo_executor_ref", None)
     if executor_ref is not None:
         try:
@@ -402,8 +400,94 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
                 continue
             cache_sources.append((f"execution.{name}", obj))
 
+    return cache_sources
+
+
+def snapshot_node_cache_cuda_usage(max_depth=6):
+    if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
+        return None
+
+    execution = _get_execution_module()
+    if execution is None:
+        log.warning("[NodeCache] execution module not available")
+        return None
+
+    cache_sources = _collect_node_cache_sources(execution)
     if not cache_sources:
-        log.info(f"[NodeCache] {tag} no cache sources found in comfy.execution")
+        log.info("[NodeCache] no cache sources found")
+        return {}
+
+    snapshot = {}
+    for source_name, cache_obj in cache_sources:
+        entries = _collect_cache_entries(cache_obj)
+        entry_bytes = {}
+        total_bytes = 0
+        for key, value in entries:
+            bytes_now = _cuda_tensor_bytes(value, set(), 0, max_depth)
+            if bytes_now > 0:
+                entry_bytes[key] = bytes_now
+                total_bytes += bytes_now
+        snapshot[source_name] = {
+            "total": total_bytes,
+            "entries": entry_bytes,
+        }
+    return snapshot
+
+
+def report_node_cache_cuda_delta(before, after, tag="", max_items=10):
+    if before is None or after is None:
+        return None
+
+    sources = set(before.keys()) | set(after.keys())
+    for source in sorted(sources):
+        before_info = before.get(source, {})
+        after_info = after.get(source, {})
+        before_total = before_info.get("total", 0)
+        after_total = after_info.get("total", 0)
+        if before_total == after_total:
+            continue
+
+        log.info(
+            f"[NodeCache] {tag} {source} "
+            f"{before_total / (1024 ** 3):.3f} GB -> {after_total / (1024 ** 3):.3f} GB "
+            f"(delta {(after_total - before_total) / (1024 ** 3):.3f} GB)"
+        )
+
+        before_entries = before_info.get("entries", {})
+        after_entries = after_info.get("entries", {})
+        changes = []
+        for key in set(before_entries.keys()) | set(after_entries.keys()):
+            b = before_entries.get(key, 0)
+            a = after_entries.get(key, 0)
+            if a != b:
+                changes.append((abs(a - b), a - b, key, b, a))
+
+        changes.sort(key=lambda x: x[0], reverse=True)
+        for _, delta, key, b, a in changes[:max_items]:
+            key_text = key
+            if len(key_text) > 160:
+                key_text = key_text[:157] + "..."
+            log.info(
+                f"[NodeCache] {tag} {source} {key_text} "
+                f"{b / (1024 ** 2):.2f} MB -> {a / (1024 ** 2):.2f} MB "
+                f"(delta {delta / (1024 ** 2):.2f} MB)"
+            )
+    return True
+
+
+def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
+    """Best-effort scan of ComfyUI node cache for CUDA tensor usage."""
+    if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
+        return None
+    execution = _get_execution_module()
+    if execution is None:
+        log.warning(f"[NodeCache] {tag} execution module not available")
+        return None
+
+    cache_sources = _collect_node_cache_sources(execution)
+
+    if not cache_sources:
+        log.info(f"[NodeCache] {tag} no cache sources found")
         return None
 
     for source_name, cache_dict in cache_sources:

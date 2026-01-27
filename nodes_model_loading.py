@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import os, gc, uuid
-from .utils import log, apply_lora, hard_offload_transformer, report_node_cache_cuda_usage
+from .utils import log, apply_lora, hard_offload_transformer, report_node_cache_cuda_usage, snapshot_node_cache_cuda_usage, report_node_cache_cuda_delta
 import numpy as np
 from tqdm import tqdm
 import re
@@ -1719,6 +1719,7 @@ class WanVideoModelLoader:
         patcher.model.is_patched = False
 
         def _clear_shot_lora(model_patcher, unpatch_all=None):
+            before_cache = snapshot_node_cache_cuda_usage()
             try:
                 transformer_mod = model_patcher.model.diffusion_model
             except Exception:
@@ -1739,7 +1740,8 @@ class WanVideoModelLoader:
                     log.warning(f"Failed to hard offload transformer during per-shot cleanup: {exc}")
 
             # Optional debug: report node cache CUDA usage after model cache cleanup.
-            report_node_cache_cuda_usage(tag="after_modelcache_cleanup")
+            after_cache = snapshot_node_cache_cuda_usage()
+            report_node_cache_cuda_delta(before_cache, after_cache, tag="modelcache_cleanup")
 
         patcher.add_callback(CallbacksMP.ON_DETACH, _clear_shot_lora)
         patcher.add_callback(CallbacksMP.ON_EJECT_MODEL, _clear_shot_lora)
