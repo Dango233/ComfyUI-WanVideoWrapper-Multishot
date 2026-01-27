@@ -339,6 +339,38 @@ def _collect_cache_entries(cache_obj):
     return entries
 
 
+def _collect_cache_entry_handles(cache_obj):
+    """Return list of (container_dict, key, value, display_key) for cache entries."""
+    entries = []
+    if cache_obj is None:
+        return entries
+
+    if hasattr(cache_obj, "cache") and isinstance(cache_obj.cache, dict):
+        def _walk(cache, prefix=""):
+            for key, value in list(cache.cache.items()):
+                entries.append((cache.cache, key, value, f"{prefix}{repr(key)}"))
+            subcaches = getattr(cache, "subcaches", None)
+            if isinstance(subcaches, dict):
+                for subkey, subcache in list(subcaches.items()):
+                    _walk(subcache, prefix=f"{prefix}{repr(subkey)}/")
+        _walk(cache_obj)
+        return entries
+
+    if isinstance(cache_obj, dict):
+        for key, value in list(cache_obj.items()):
+            entries.append((cache_obj, key, value, repr(key)))
+        return entries
+
+    for attr in ("cache", "node_cache", "NODE_CACHE"):
+        if hasattr(cache_obj, attr):
+            val = getattr(cache_obj, attr)
+            if isinstance(val, dict):
+                for key, value in list(val.items()):
+                    entries.append((val, key, value, repr(key)))
+                return entries
+    return entries
+
+
 def _ensure_execution_hook(execution):
     if getattr(execution, "_wanvideo_executor_hooked", False):
         return
@@ -390,6 +422,71 @@ def _snapshot_node_cache_for_executor(executor, max_depth=6):
     return _snapshot_from_cache_sources(cache_sources, max_depth)
 
 
+def _soft_empty_cache_raw():
+    original = getattr(mm, "_wanvideo_soft_cache_original", None)
+    if original is None:
+        original = getattr(mm, "soft_empty_cache", None)
+    if original is None:
+        return
+    try:
+        original()
+    except Exception:
+        pass
+
+
+def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
+    """Evict cache entries one-by-one and report allocated-memory deltas."""
+    if executor is None or not hasattr(executor, "caches"):
+        return None
+    if not torch.cuda.is_available():
+        return None
+    min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
+    cache_sources = []
+    for cache_name in ("outputs", "ui", "objects"):
+        cache_obj = getattr(executor.caches, cache_name, None)
+        if cache_obj is not None:
+            cache_sources.append((f"PromptExecutor.caches.{cache_name}", cache_obj))
+
+    if not cache_sources:
+        return None
+
+    for source_name, cache_obj in cache_sources:
+        entries = _collect_cache_entry_handles(cache_obj)
+        if not entries:
+            continue
+        for container, key, value, display_key in entries:
+            before = _cuda_mem_snapshot()
+            try:
+                del container[key]
+            except Exception:
+                try:
+                    container.pop(key, None)
+                except Exception:
+                    pass
+            value = None
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            _soft_empty_cache_raw()
+            after = _cuda_mem_snapshot()
+
+            if before is None or after is None:
+                continue
+            freed = before["allocated"] - after["allocated"]
+            if freed < min_delta_mb * 1024 * 1024:
+                continue
+            key_text = display_key
+            if len(key_text) > 160:
+                key_text = key_text[:157] + "..."
+            log.info(
+                f"[NodeCache] {tag} {source_name} {key_text} "
+                f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
+                f"(delta {-freed / (1024 ** 3):.3f} GB)"
+            )
+    return True
+
+
 def _ensure_prompt_executor_reset_hook(execution):
     if getattr(execution, "_wanvideo_reset_hooked", False):
         return
@@ -406,6 +503,10 @@ def _ensure_prompt_executor_reset_hook(execution):
         census_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_CENSUS")
         stats_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
         snapshot_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
+        evict_debug = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT")
+
+        if evict_debug:
+            _evict_node_cache_entries(self, tag="prompt_executor_reset_evict")
 
         before_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         before_mem = _cuda_mem_snapshot() if mem_debug else None
@@ -904,6 +1005,7 @@ def _ensure_soft_empty_cache_hook():
             report_cuda_snapshot_delta(before_snapshot, after_snapshot, tag="soft_empty_cache")
         return result
 
+    mm._wanvideo_soft_cache_original = original
     mm.soft_empty_cache = _wrapped_soft_empty_cache
     mm._wanvideo_soft_cache_hooked = True
 
