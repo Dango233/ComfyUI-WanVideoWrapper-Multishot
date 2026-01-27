@@ -381,19 +381,25 @@ def _ensure_prompt_executor_reset_hook(execution):
         return
 
     def _wrapped_reset(self, *args, **kwargs):
-        node_debug = os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes")
-        mem_debug = os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
-        census_debug = os.getenv("WANVIDEO_DEBUG_CUDA_CENSUS", "").lower() in ("1", "true", "yes")
+        node_debug = _env_enabled("WANVIDEO_DEBUG_NODECACHE")
+        mem_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_MEM")
+        census_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_CENSUS")
+        stats_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
+        snapshot_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
 
         before_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         before_mem = _cuda_mem_snapshot() if mem_debug else None
         before_census = snapshot_cuda_tensor_census() if census_debug else None
+        before_stats = snapshot_cuda_stats() if stats_debug else None
+        before_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
 
         result = original_reset(self, *args, **kwargs)
 
         after_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         after_mem = _cuda_mem_snapshot() if mem_debug else None
         after_census = snapshot_cuda_tensor_census() if census_debug else None
+        after_stats = snapshot_cuda_stats() if stats_debug else None
+        after_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
 
         if node_debug:
             report_node_cache_cuda_delta(before_cache, after_cache, tag="prompt_executor_reset")
@@ -401,6 +407,10 @@ def _ensure_prompt_executor_reset_hook(execution):
             report_cuda_mem_delta(before_mem, after_mem, tag="prompt_executor_reset")
         if census_debug:
             report_cuda_tensor_census_delta(before_census, after_census, tag="prompt_executor_reset")
+        if stats_debug:
+            report_cuda_stats_delta(before_stats, after_stats, tag="prompt_executor_reset")
+        if snapshot_debug:
+            report_cuda_snapshot_delta(before_snapshot, after_snapshot, tag="prompt_executor_reset")
         return result
 
     PromptExecutor.reset = _wrapped_reset
@@ -596,6 +606,7 @@ def _cuda_mem_snapshot(device=None):
 def report_cuda_mem_delta(before, after, tag="", min_delta_mb=32):
     if before is None or after is None:
         return None
+    min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
     alloc_delta = after["allocated"] - before["allocated"]
     reserv_delta = after["reserved"] - before["reserved"]
     if abs(alloc_delta) < min_delta_mb * 1024 * 1024 and abs(reserv_delta) < min_delta_mb * 1024 * 1024:
@@ -610,8 +621,32 @@ def report_cuda_mem_delta(before, after, tag="", min_delta_mb=32):
     return True
 
 
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes")
+
+
+def _get_min_delta_mb(default=64):
+    raw = os.getenv("WANVIDEO_DEBUG_MIN_DELTA_MB")
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _get_max_items(default=20):
+    raw = os.getenv("WANVIDEO_DEBUG_MAX_ITEMS")
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return default
+
+
 def snapshot_cuda_tensor_census():
-    if os.getenv("WANVIDEO_DEBUG_CUDA_CENSUS", "").lower() not in ("1", "true", "yes"):
+    if not _env_enabled("WANVIDEO_DEBUG_CUDA_CENSUS"):
         return None
     if not torch.cuda.is_available():
         return None
@@ -654,6 +689,8 @@ def snapshot_cuda_tensor_census():
 def report_cuda_tensor_census_delta(before, after, tag="", min_delta_mb=64, max_items=20):
     if before is None or after is None:
         return None
+    min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
+    max_items = _get_max_items(default=max_items)
 
     before_total = before.get("_total_bytes", 0)
     after_total = after.get("_total_bytes", 0)
@@ -687,6 +724,136 @@ def report_cuda_tensor_census_delta(before, after, tag="", min_delta_mb=64, max_
     return True
 
 
+def snapshot_cuda_stats():
+    if not _env_enabled("WANVIDEO_DEBUG_CUDA_STATS"):
+        return None
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device = mm.get_torch_device()
+    except Exception:
+        device = torch.device("cuda")
+    try:
+        stats = torch.cuda.memory_stats(device)
+    except Exception:
+        return None
+    filtered = {}
+    for k, v in stats.items():
+        if not isinstance(v, (int, float)):
+            continue
+        if "bytes" not in k:
+            continue
+        if ".current" not in k:
+            continue
+        filtered[k] = int(v)
+    filtered["_device"] = str(device)
+    return filtered
+
+
+def report_cuda_stats_delta(before, after, tag="", min_delta_mb=64, max_items=20):
+    if before is None or after is None:
+        return None
+    min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
+    max_items = _get_max_items(default=max_items)
+
+    device = before.get("_device") or after.get("_device") or "cuda"
+    keys = set(before.keys()) | set(after.keys())
+    keys.discard("_device")
+    changes = []
+    for key in keys:
+        b = before.get(key, 0)
+        a = after.get(key, 0)
+        delta = a - b
+        if abs(delta) >= min_delta_mb * 1024 * 1024:
+            changes.append((abs(delta), delta, key, b, a))
+
+    if not changes:
+        return None
+
+    changes.sort(key=lambda x: x[0], reverse=True)
+    log.info(f"[CUDA] {tag} stats {device} changes={len(changes)}")
+    for _, delta, key, b, a in changes[:max_items]:
+        log.info(
+            f"[CUDA] {tag} stats {key} "
+            f"{b / (1024 ** 2):.2f} MB -> {a / (1024 ** 2):.2f} MB "
+            f"(delta {delta / (1024 ** 2):.2f} MB)"
+        )
+    return True
+
+
+def snapshot_cuda_snapshot_summary():
+    if not _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT"):
+        return None
+    if not torch.cuda.is_available():
+        return None
+    try:
+        snapshot = torch.cuda.memory_snapshot()
+    except Exception:
+        return None
+
+    summary = {
+        "_total_segments": 0,
+        "_total_bytes": 0,
+        "_active_bytes": 0,
+        "_inactive_bytes": 0,
+    }
+
+    for segment in snapshot:
+        try:
+            total_size = int(segment.get("total_size", 0))
+        except Exception:
+            total_size = 0
+        summary["_total_segments"] += 1
+        summary["_total_bytes"] += total_size
+
+        blocks = segment.get("blocks", [])
+        for block in blocks:
+            try:
+                size = int(block.get("size", 0))
+            except Exception:
+                size = 0
+            state = block.get("state", "")
+            if state == "active":
+                summary["_active_bytes"] += size
+            else:
+                summary["_inactive_bytes"] += size
+
+    return summary
+
+
+def report_cuda_snapshot_delta(before, after, tag="", min_delta_mb=64):
+    if before is None or after is None:
+        return None
+    min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
+    keys = ["_total_bytes", "_active_bytes", "_inactive_bytes", "_total_segments"]
+    changes = []
+    for key in keys:
+        b = before.get(key, 0)
+        a = after.get(key, 0)
+        delta = a - b
+        if key == "_total_segments":
+            if delta != 0:
+                changes.append((abs(delta), delta, key, b, a))
+        else:
+            if abs(delta) >= min_delta_mb * 1024 * 1024:
+                changes.append((abs(delta), delta, key, b, a))
+
+    if not changes:
+        return None
+
+    log.info(f"[CUDA] {tag} snapshot summary")
+    for _, delta, key, b, a in changes:
+        if key == "_total_segments":
+            log.info(f"[CUDA] {tag} snapshot {key} {b} -> {a} (delta {delta})")
+        else:
+            log.info(
+                f"[CUDA] {tag} snapshot {key} "
+                f"{b / (1024 ** 2):.2f} MB -> {a / (1024 ** 2):.2f} MB "
+                f"(delta {delta / (1024 ** 2):.2f} MB)"
+            )
+    return True
+
+
 def _ensure_soft_empty_cache_hook():
     if getattr(mm, "_wanvideo_soft_cache_hooked", False):
         return
@@ -695,12 +862,26 @@ def _ensure_soft_empty_cache_hook():
         return
 
     def _wrapped_soft_empty_cache(*args, **kwargs):
-        mem_debug = os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
-        before = _cuda_mem_snapshot() if mem_debug else None
+        mem_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_MEM")
+        stats_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
+        snapshot_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
+
+        before_mem = _cuda_mem_snapshot() if mem_debug else None
+        before_stats = snapshot_cuda_stats() if stats_debug else None
+        before_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
+
         result = original(*args, **kwargs)
-        after = _cuda_mem_snapshot() if mem_debug else None
+
+        after_mem = _cuda_mem_snapshot() if mem_debug else None
+        after_stats = snapshot_cuda_stats() if stats_debug else None
+        after_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
+
         if mem_debug:
-            report_cuda_mem_delta(before, after, tag="soft_empty_cache")
+            report_cuda_mem_delta(before_mem, after_mem, tag="soft_empty_cache")
+        if stats_debug:
+            report_cuda_stats_delta(before_stats, after_stats, tag="soft_empty_cache")
+        if snapshot_debug:
+            report_cuda_snapshot_delta(before_snapshot, after_snapshot, tag="soft_empty_cache")
         return result
 
     mm.soft_empty_cache = _wrapped_soft_empty_cache
@@ -708,9 +889,11 @@ def _ensure_soft_empty_cache_hook():
 
 
 if (
-    os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes")
-    or os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
-    or os.getenv("WANVIDEO_DEBUG_CUDA_CENSUS", "").lower() in ("1", "true", "yes")
+    _env_enabled("WANVIDEO_DEBUG_NODECACHE")
+    or _env_enabled("WANVIDEO_DEBUG_CUDA_MEM")
+    or _env_enabled("WANVIDEO_DEBUG_CUDA_CENSUS")
+    or _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
+    or _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
 ):
     _exec_mod = _get_execution_module()
     if _exec_mod is not None:
