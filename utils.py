@@ -337,6 +337,20 @@ def _ensure_execution_hook(execution):
     execution._wanvideo_executor_hooked = True
 
 
+def _find_prompt_executor_instances(execution):
+    PromptExecutor = getattr(execution, "PromptExecutor", None)
+    if PromptExecutor is None:
+        return []
+    instances = []
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, PromptExecutor):
+                instances.append(obj)
+        except Exception:
+            continue
+    return instances
+
+
 def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
     """Best-effort scan of ComfyUI node cache for CUDA tensor usage."""
     if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
@@ -366,6 +380,15 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
         if executor is not None and hasattr(executor, "caches"):
             for cache_name in ("outputs", "ui", "objects"):
                 cache_obj = getattr(executor.caches, cache_name, None)
+                if cache_obj is not None:
+                    cache_sources.append((f"PromptExecutor.caches.{cache_name}", cache_obj))
+
+    if not cache_sources:
+        instances = _find_prompt_executor_instances(execution)
+        if instances:
+            execution._wanvideo_executor_ref = weakref.ref(instances[0])
+            for cache_name in ("outputs", "ui", "objects"):
+                cache_obj = getattr(instances[0].caches, cache_name, None)
                 if cache_obj is not None:
                     cache_sources.append((f"PromptExecutor.caches.{cache_name}", cache_obj))
 
