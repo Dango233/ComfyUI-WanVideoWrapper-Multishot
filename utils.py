@@ -304,11 +304,17 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
     if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
         return None
 
+    execution = None
     try:
-        import comfy.execution as execution
-    except Exception as exc:
-        log.warning(f"[NodeCache] {tag} comfy.execution not available: {exc}")
-        return None
+        import execution as _execution
+        execution = _execution
+    except Exception:
+        try:
+            import comfy.execution as _execution
+            execution = _execution
+        except Exception as exc:
+            log.warning(f"[NodeCache] {tag} execution module not available: {exc}")
+            return None
 
     cache_sources = []
     for name in dir(execution):
