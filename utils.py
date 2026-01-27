@@ -5,13 +5,14 @@ import math
 from tqdm import tqdm
 from pathlib import Path
 import gc
+import os
 import types, collections
 from comfy.utils import ProgressBar, copy_to_param, set_attr_param
 from comfy.model_patcher import get_key_weight, string_to_seed
 from comfy.lora import calculate_weight
 
 from comfy.float import stochastic_rounding
-from .custom_linear import remove_lora_from_module
+from .custom_linear import remove_lora_from_module, remove_shot_lora_from_module
 import folder_paths
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
@@ -54,6 +55,12 @@ def offload_transformer(transformer, remove_lora=True):
     transformer.magcache_state.clear_all()
     transformer.easycache_state.clear_all()
 
+    # Always clear per-shot LoRA buffers (runtime-only) before offloading.
+    try:
+        remove_shot_lora_from_module(transformer)
+    except Exception as exc:
+        log.warning(f"Failed to clear per-shot LoRA before offload: {exc}")
+
     if transformer.patched_linear:
         for name, param in transformer.named_parameters():
             if "loras" in name or "controlnet" in name:
@@ -90,6 +97,12 @@ def hard_offload_transformer(transformer, remove_lora=True):
     transformer.teacache_state.clear_all()
     transformer.magcache_state.clear_all()
     transformer.easycache_state.clear_all()
+
+    # Always clear per-shot LoRA buffers (runtime-only) before offloading.
+    try:
+        remove_shot_lora_from_module(transformer)
+    except Exception as exc:
+        log.warning(f"Failed to clear per-shot LoRA before hard offload: {exc}")
 
     for name, param in transformer.named_parameters():
         if "loras" in name or "controlnet" in name:
@@ -249,6 +262,97 @@ def print_memory(device, process="Sampling"):
     log.info(f"[{process}] Max reserved memory: {max_reserved=:.3f} GB")
     #memory_summary = torch.cuda.memory_summary(device=device, abbreviated=False)
     #log.info(f"Memory Summary:\n{memory_summary}")
+
+
+def _cuda_tensor_bytes(obj, seen, depth, max_depth):
+    if id(obj) in seen:
+        return 0
+    seen.add(id(obj))
+    if depth > max_depth:
+        return 0
+    try:
+        if torch.is_tensor(obj):
+            if obj.is_cuda:
+                return obj.nelement() * obj.element_size()
+            return 0
+    except Exception:
+        return 0
+
+    if isinstance(obj, dict):
+        return sum(_cuda_tensor_bytes(v, seen, depth + 1, max_depth) for v in obj.values())
+    if isinstance(obj, (list, tuple, set)):
+        return sum(_cuda_tensor_bytes(v, seen, depth + 1, max_depth) for v in obj)
+
+    if hasattr(obj, "__dict__"):
+        return _cuda_tensor_bytes(vars(obj), seen, depth + 1, max_depth)
+    return 0
+
+
+def _extract_cache_dict(obj):
+    if isinstance(obj, dict):
+        return obj
+    for attr in ("cache", "node_cache", "NODE_CACHE"):
+        if hasattr(obj, attr):
+            val = getattr(obj, attr)
+            if isinstance(val, dict):
+                return val
+    return None
+
+
+def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
+    """Best-effort scan of ComfyUI node cache for CUDA tensor usage."""
+    if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() not in ("1", "true", "yes"):
+        return None
+
+    try:
+        import comfy.execution as execution
+    except Exception as exc:
+        log.warning(f"[NodeCache] {tag} comfy.execution not available: {exc}")
+        return None
+
+    cache_sources = []
+    for name in dir(execution):
+        if "cache" not in name.lower():
+            continue
+        try:
+            obj = getattr(execution, name)
+        except Exception:
+            continue
+        cache_dict = _extract_cache_dict(obj)
+        if cache_dict is not None:
+            cache_sources.append((f"execution.{name}", cache_dict))
+
+    if not cache_sources:
+        log.info(f"[NodeCache] {tag} no cache sources found in comfy.execution")
+        return None
+
+    for source_name, cache_dict in cache_sources:
+        entries = []
+        total_bytes = 0
+        for key, value in cache_dict.items():
+            bytes_now = _cuda_tensor_bytes(value, set(), 0, max_depth)
+            total_bytes += bytes_now
+            if bytes_now > 0:
+                entries.append((bytes_now, key, type(value).__name__))
+
+        if total_bytes == 0:
+            log.info(f"[NodeCache] {tag} {source_name} has no CUDA tensors")
+            continue
+
+        entries.sort(key=lambda x: x[0], reverse=True)
+        log.info(
+            f"[NodeCache] {tag} {source_name} entries={len(cache_dict)} "
+            f"cuda={total_bytes / (1024 ** 3):.3f} GB"
+        )
+        for bytes_now, key, type_name in entries[:max_items]:
+            key_text = repr(key)
+            if len(key_text) > 160:
+                key_text = key_text[:157] + "..."
+            log.info(
+                f"[NodeCache] {tag} {source_name} {type_name} {key_text} "
+                f"{bytes_now / (1024 ** 2):.2f} MB"
+            )
+    return True
 
 def get_module_memory_mb(module):
     memory = 0

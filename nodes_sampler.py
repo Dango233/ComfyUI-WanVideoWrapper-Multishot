@@ -4,14 +4,20 @@ import numpy as np
 from tqdm import tqdm
 import inspect
 from .wanvideo.modules.model import rope_params
-from .custom_linear import remove_lora_from_module, set_lora_params, set_shot_lora_params, _replace_linear
+from .custom_linear import (
+    remove_lora_from_module,
+    set_lora_params,
+    set_shot_lora_params,
+    _replace_linear,
+    report_shot_lora_buffers,
+)
 from .wanvideo.modules.shot_utils import build_shot_indices, SMOOTH_WINDOW_TOKENS
 from .wanvideo.schedulers import get_scheduler, scheduler_list
 from .gguf.gguf import set_lora_params_gguf
 from .multitalk.multitalk import add_noise
 from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling,
-                   offload_transformer, hard_offload_transformer, init_blockswap)
+                   offload_transformer, hard_offload_transformer, init_blockswap, report_node_cache_cuda_usage)
 from .multitalk.multitalk_loop import multitalk_loop
 from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights, standardize_lora_key_format, filter_state_dict_by_blocks, model_lora_keys_unet
@@ -163,10 +169,33 @@ def prepare_shot_lora_payload(base_model, shot_lora_specs):
     return payload
 
 
+def _unwrap_transformer_module(transformer):
+    current = transformer
+    while True:
+        next_mod = None
+        for attr in ("_orig_mod", "module"):
+            candidate = getattr(current, attr, None)
+            if isinstance(candidate, torch.nn.Module):
+                next_mod = candidate
+                break
+        if next_mod is None or next_mod is current:
+            return current
+        current = next_mod
+
+
+def _debug_shot_lora_state(transformer, tag):
+    if os.getenv("WANVIDEO_DEBUG_SHOT_LORA", "").lower() in ("1", "true", "yes"):
+        report_shot_lora_buffers(transformer, tag=tag)
+    report_node_cache_cuda_usage(tag=tag)
+
+
 def assign_shot_lora_to_transformer(transformer, shot_lora_payload):
+    target = _unwrap_transformer_module(transformer)
     if not shot_lora_payload:
-        set_shot_lora_params(transformer, {})
-        transformer.shot_lora_count = 0
+        set_shot_lora_params(target, {})
+        target.shot_lora_count = 0
+        if target is not transformer:
+            transformer.shot_lora_count = 0
         return 0
 
     shot_count = len(shot_lora_payload)
@@ -176,8 +205,10 @@ def assign_shot_lora_to_transformer(transformer, shot_lora_payload):
             slots = per_module.setdefault(key, [None] * shot_count)
             slots[shot_idx] = components
 
-    set_shot_lora_params(transformer, per_module)
-    transformer.shot_lora_count = shot_count
+    set_shot_lora_params(target, per_module)
+    target.shot_lora_count = shot_count
+    if target is not transformer:
+        transformer.shot_lora_count = shot_count
     return shot_count
 
 
@@ -2424,8 +2455,10 @@ class WanVideoSampler:
                                 offload_transformer(transformer)
                         # Always clear per-shot LoRA buffers to avoid VRAM residue.
                         assign_shot_lora_to_transformer(transformer, [])
+                        _debug_shot_lora_state(transformer, "after_clear_shot_lora")
                         if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                             hard_offload_transformer(transformer)
+                            _debug_shot_lora_state(transformer, "after_hard_offload")
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2722,8 +2755,10 @@ class WanVideoSampler:
                                 offload_transformer(transformer)
                         # Always clear per-shot LoRA buffers to avoid VRAM residue.
                         assign_shot_lora_to_transformer(transformer, [])
+                        _debug_shot_lora_state(transformer, "after_clear_shot_lora")
                         if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                             hard_offload_transformer(transformer)
+                            _debug_shot_lora_state(transformer, "after_hard_offload")
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2839,8 +2874,10 @@ class WanVideoSampler:
                 log.error(f"Error during sampling: {e}")
                 # Always clear per-shot LoRA buffers to avoid VRAM residue on failures.
                 assign_shot_lora_to_transformer(transformer, [])
+                _debug_shot_lora_state(transformer, "after_clear_shot_lora_error")
                 if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                     hard_offload_transformer(transformer)
+                    _debug_shot_lora_state(transformer, "after_hard_offload_error")
                 raise e
 
         if phantom_latents is not None:
@@ -2867,8 +2904,10 @@ class WanVideoSampler:
 
         # Always clear per-shot LoRA buffers to avoid VRAM residue.
         assign_shot_lora_to_transformer(transformer, [])
+        _debug_shot_lora_state(transformer, "after_clear_shot_lora")
         if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
             hard_offload_transformer(transformer)
+            _debug_shot_lora_state(transformer, "after_hard_offload")
 
         try:
             print_memory(device)

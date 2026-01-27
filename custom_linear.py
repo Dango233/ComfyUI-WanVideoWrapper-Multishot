@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
+import logging
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
+
+log = logging.getLogger(__name__)
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
 def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: torch.Tensor, lora_diff_2: float, lora_strength: torch.Tensor) -> torch.Tensor:
@@ -448,6 +451,44 @@ def _iter_modules_with_wrappers(root):
                 wrapped = None
             if isinstance(wrapped, nn.Module):
                 stack.append(wrapped)
+
+
+def iter_shot_lora_buffers(module):
+    """Yield (submodule, buffer_name, tensor) for per-shot LoRA buffers."""
+    for submodule in _iter_modules_with_wrappers(module):
+        buffers = getattr(submodule, "_buffers", None)
+        if not buffers:
+            continue
+        for name, buf in list(buffers.items()):
+            if name.startswith("_shot_lora_") and isinstance(buf, torch.Tensor):
+                yield submodule, name, buf
+
+
+def report_shot_lora_buffers(module, tag="", top_n=8):
+    """Log current per-shot LoRA buffer footprint (GPU only)."""
+    buffers = list(iter_shot_lora_buffers(module))
+    if not buffers:
+        log.info(f"[ShotLoRA] {tag} no buffers found")
+        return {"count": 0, "total_bytes": 0, "per_device": {}}
+
+    total_bytes = 0
+    per_device = {}
+    entries = []
+    for _, name, buf in buffers:
+        bytes_now = buf.nelement() * buf.element_size()
+        total_bytes += bytes_now
+        dev = str(buf.device)
+        per_device[dev] = per_device.get(dev, 0) + bytes_now
+        entries.append((bytes_now, name, dev, tuple(buf.shape), str(buf.dtype)))
+
+    entries.sort(key=lambda x: x[0], reverse=True)
+    total_gb = total_bytes / (1024 ** 3)
+    per_device_gb = {dev: b / (1024 ** 3) for dev, b in per_device.items()}
+    log.info(f"[ShotLoRA] {tag} buffers={len(buffers)} total={total_gb:.3f} GB per_device={per_device_gb}")
+    for bytes_now, name, dev, shape, dtype in entries[:top_n]:
+        log.info(f"[ShotLoRA] {tag} {name} {dev} {dtype} {shape} {bytes_now / (1024 ** 2):.2f} MB")
+
+    return {"count": len(buffers), "total_bytes": total_bytes, "per_device": per_device}
 
 
 def _clear_shot_lora_buffers(module):
