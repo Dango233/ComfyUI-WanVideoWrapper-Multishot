@@ -441,6 +441,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     if not torch.cuda.is_available():
         return None
     min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
+    report_sizes = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_REPORT_SIZE")
     cache_sources = []
     for cache_name in ("outputs", "ui", "objects"):
         cache_obj = getattr(executor.caches, cache_name, None)
@@ -450,11 +451,26 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     if not cache_sources:
         return None
 
+    total_entries = 0
     for source_name, cache_obj in cache_sources:
         entries = _collect_cache_entry_handles(cache_obj)
         if not entries:
             continue
+        total_entries += len(entries)
         for container, key, value, display_key in entries:
+            key_text = display_key
+            if len(key_text) > 160:
+                key_text = key_text[:157] + "..."
+            if report_sizes:
+                try:
+                    bytes_now = _cuda_tensor_bytes(value, set(), 0, 6)
+                except Exception:
+                    bytes_now = 0
+                if bytes_now > 0:
+                    log.info(
+                        f"[NodeCache] {tag} {source_name} {key_text} "
+                        f"cuda_bytes {bytes_now / (1024 ** 2):.2f} MB"
+                    )
             before = _cuda_mem_snapshot()
             try:
                 del container[key]
@@ -476,14 +492,12 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
             freed = before["allocated"] - after["allocated"]
             if freed < min_delta_mb * 1024 * 1024:
                 continue
-            key_text = display_key
-            if len(key_text) > 160:
-                key_text = key_text[:157] + "..."
             log.info(
                 f"[NodeCache] {tag} {source_name} {key_text} "
                 f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
                 f"(delta {-freed / (1024 ** 3):.3f} GB)"
             )
+    log.info(f"[NodeCache] {tag} done entries={total_entries}")
     return True
 
 
