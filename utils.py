@@ -383,15 +383,24 @@ def _ensure_prompt_executor_reset_hook(execution):
     def _wrapped_reset(self, *args, **kwargs):
         node_debug = os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes")
         mem_debug = os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
+        census_debug = os.getenv("WANVIDEO_DEBUG_CUDA_CENSUS", "").lower() in ("1", "true", "yes")
+
         before_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         before_mem = _cuda_mem_snapshot() if mem_debug else None
+        before_census = snapshot_cuda_tensor_census() if census_debug else None
+
         result = original_reset(self, *args, **kwargs)
+
         after_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         after_mem = _cuda_mem_snapshot() if mem_debug else None
+        after_census = snapshot_cuda_tensor_census() if census_debug else None
+
         if node_debug:
             report_node_cache_cuda_delta(before_cache, after_cache, tag="prompt_executor_reset")
         if mem_debug:
             report_cuda_mem_delta(before_mem, after_mem, tag="prompt_executor_reset")
+        if census_debug:
+            report_cuda_tensor_census_delta(before_census, after_census, tag="prompt_executor_reset")
         return result
 
     PromptExecutor.reset = _wrapped_reset
@@ -601,6 +610,83 @@ def report_cuda_mem_delta(before, after, tag="", min_delta_mb=32):
     return True
 
 
+def snapshot_cuda_tensor_census():
+    if os.getenv("WANVIDEO_DEBUG_CUDA_CENSUS", "").lower() not in ("1", "true", "yes"):
+        return None
+    if not torch.cuda.is_available():
+        return None
+
+    census = {}
+    total = 0
+    for obj in gc.get_objects():
+        try:
+            if not torch.is_tensor(obj):
+                continue
+        except Exception:
+            continue
+        try:
+            if not obj.is_cuda:
+                continue
+        except Exception:
+            continue
+
+        try:
+            numel = obj.nelement()
+            elem = obj.element_size()
+            bytes_now = numel * elem
+        except Exception:
+            continue
+
+        dtype = str(obj.dtype)
+        device = str(obj.device)
+        try:
+            shape = tuple(obj.shape)
+        except Exception:
+            shape = ("?",)
+        key = f"{type(obj).__name__} {device} {dtype} {shape}"
+        census[key] = census.get(key, 0) + bytes_now
+        total += bytes_now
+
+    census["_total_bytes"] = total
+    return census
+
+
+def report_cuda_tensor_census_delta(before, after, tag="", min_delta_mb=64, max_items=20):
+    if before is None or after is None:
+        return None
+
+    before_total = before.get("_total_bytes", 0)
+    after_total = after.get("_total_bytes", 0)
+    total_delta = after_total - before_total
+    if abs(total_delta) < min_delta_mb * 1024 * 1024:
+        return None
+
+    log.info(
+        f"[CUDA] {tag} tensor_census total "
+        f"{before_total / (1024 ** 3):.3f} GB -> {after_total / (1024 ** 3):.3f} GB "
+        f"(delta {total_delta / (1024 ** 3):.3f} GB)"
+    )
+
+    changes = []
+    keys = set(before.keys()) | set(after.keys())
+    keys.discard("_total_bytes")
+    for key in keys:
+        b = before.get(key, 0)
+        a = after.get(key, 0)
+        delta = a - b
+        if abs(delta) >= min_delta_mb * 1024 * 1024:
+            changes.append((abs(delta), delta, key, b, a))
+
+    changes.sort(key=lambda x: x[0], reverse=True)
+    for _, delta, key, b, a in changes[:max_items]:
+        log.info(
+            f"[CUDA] {tag} tensor_census {key} "
+            f"{b / (1024 ** 2):.2f} MB -> {a / (1024 ** 2):.2f} MB "
+            f"(delta {delta / (1024 ** 2):.2f} MB)"
+        )
+    return True
+
+
 def _ensure_soft_empty_cache_hook():
     if getattr(mm, "_wanvideo_soft_cache_hooked", False):
         return
@@ -621,7 +707,11 @@ def _ensure_soft_empty_cache_hook():
     mm._wanvideo_soft_cache_hooked = True
 
 
-if os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes") or os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes"):
+if (
+    os.getenv("WANVIDEO_DEBUG_NODECACHE", "").lower() in ("1", "true", "yes")
+    or os.getenv("WANVIDEO_DEBUG_CUDA_MEM", "").lower() in ("1", "true", "yes")
+    or os.getenv("WANVIDEO_DEBUG_CUDA_CENSUS", "").lower() in ("1", "true", "yes")
+):
     _exec_mod = _get_execution_module()
     if _exec_mod is not None:
         _ensure_execution_hook(_exec_mod)
