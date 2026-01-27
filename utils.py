@@ -6,6 +6,7 @@ from tqdm import tqdm
 from pathlib import Path
 import gc
 import os
+import weakref
 import types, collections
 from comfy.utils import ProgressBar, copy_to_param, set_attr_param
 from comfy.model_patcher import get_key_weight, string_to_seed
@@ -288,15 +289,52 @@ def _cuda_tensor_bytes(obj, seen, depth, max_depth):
     return 0
 
 
-def _extract_cache_dict(obj):
-    if isinstance(obj, dict):
-        return obj
+def _collect_cache_entries(cache_obj):
+    entries = []
+    if cache_obj is None:
+        return entries
+
+    # BasicCache / HierarchicalCache / LRUCache-like objects
+    if hasattr(cache_obj, "cache") and isinstance(cache_obj.cache, dict):
+        def _walk(cache, prefix=""):
+            for key, value in cache.cache.items():
+                entries.append((f"{prefix}{repr(key)}", value))
+            subcaches = getattr(cache, "subcaches", None)
+            if isinstance(subcaches, dict):
+                for subkey, subcache in subcaches.items():
+                    _walk(subcache, prefix=f"{prefix}{repr(subkey)}/")
+        _walk(cache_obj)
+        return entries
+
+    if isinstance(cache_obj, dict):
+        entries.extend([(repr(k), v) for k, v in cache_obj.items()])
+        return entries
+
     for attr in ("cache", "node_cache", "NODE_CACHE"):
-        if hasattr(obj, attr):
-            val = getattr(obj, attr)
+        if hasattr(cache_obj, attr):
+            val = getattr(cache_obj, attr)
             if isinstance(val, dict):
-                return val
-    return None
+                entries.extend([(repr(k), v) for k, v in val.items()])
+                return entries
+    return entries
+
+
+def _ensure_execution_hook(execution):
+    if getattr(execution, "_wanvideo_executor_hooked", False):
+        return
+    PromptExecutor = getattr(execution, "PromptExecutor", None)
+    if PromptExecutor is None:
+        return
+    original_async = getattr(PromptExecutor, "execute_async", None)
+    if original_async is None:
+        return
+
+    async def _wrapped_execute_async(self, *args, **kwargs):
+        execution._wanvideo_executor_ref = weakref.ref(self)
+        return await original_async(self, *args, **kwargs)
+
+    PromptExecutor.execute_async = _wrapped_execute_async
+    execution._wanvideo_executor_hooked = True
 
 
 def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
@@ -316,17 +354,30 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
             log.warning(f"[NodeCache] {tag} execution module not available: {exc}")
             return None
 
+    _ensure_execution_hook(execution)
+
     cache_sources = []
-    for name in dir(execution):
-        if "cache" not in name.lower():
-            continue
+    executor_ref = getattr(execution, "_wanvideo_executor_ref", None)
+    if executor_ref is not None:
         try:
-            obj = getattr(execution, name)
+            executor = executor_ref()
         except Exception:
-            continue
-        cache_dict = _extract_cache_dict(obj)
-        if cache_dict is not None:
-            cache_sources.append((f"execution.{name}", cache_dict))
+            executor = None
+        if executor is not None and hasattr(executor, "caches"):
+            for cache_name in ("outputs", "ui", "objects"):
+                cache_obj = getattr(executor.caches, cache_name, None)
+                if cache_obj is not None:
+                    cache_sources.append((f"PromptExecutor.caches.{cache_name}", cache_obj))
+
+    if not cache_sources:
+        for name in dir(execution):
+            if "cache" not in name.lower():
+                continue
+            try:
+                obj = getattr(execution, name)
+            except Exception:
+                continue
+            cache_sources.append((f"execution.{name}", obj))
 
     if not cache_sources:
         log.info(f"[NodeCache] {tag} no cache sources found in comfy.execution")
@@ -335,7 +386,8 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
     for source_name, cache_dict in cache_sources:
         entries = []
         total_bytes = 0
-        for key, value in cache_dict.items():
+        cache_entries = _collect_cache_entries(cache_dict)
+        for key, value in cache_entries:
             bytes_now = _cuda_tensor_bytes(value, set(), 0, max_depth)
             total_bytes += bytes_now
             if bytes_now > 0:
@@ -347,7 +399,7 @@ def report_node_cache_cuda_usage(tag="", max_items=10, max_depth=6):
 
         entries.sort(key=lambda x: x[0], reverse=True)
         log.info(
-            f"[NodeCache] {tag} {source_name} entries={len(cache_dict)} "
+            f"[NodeCache] {tag} {source_name} entries={len(cache_entries)} "
             f"cuda={total_bytes / (1024 ** 3):.3f} GB"
         )
         for bytes_now, key, type_name in entries[:max_items]:
