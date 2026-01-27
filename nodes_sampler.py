@@ -17,7 +17,8 @@ from .gguf.gguf import set_lora_params_gguf
 from .multitalk.multitalk import add_noise
 from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scale, setup_radial_attention,
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling,
-                   offload_transformer, hard_offload_transformer, init_blockswap, report_node_cache_cuda_usage)
+                   offload_transformer, hard_offload_transformer, init_blockswap, report_node_cache_cuda_usage,
+                   cleanup_cuda_cache)
 from .multitalk.multitalk_loop import multitalk_loop
 from .cache_methods.cache_methods import cache_report
 from .nodes_model_loading import load_weights, standardize_lora_key_format, filter_state_dict_by_blocks, model_lora_keys_unet
@@ -247,6 +248,8 @@ class WanVideoSampler:
                 "multitalk_embeds": ("MULTITALK_EMBEDS", ),
                 "freeinit_args": ("FREEINITARGS", ),
                 "holocine_args": ("HOLOCINE_SHOTARGS", ),
+                "sampler_cleanup": (["none", "empty_cache", "empty_cache_if_shot_lora"], {"default": "none", "tooltip": "Optional: run CUDA cache cleanup after sampling. 'empty_cache_if_shot_lora' only triggers when per-shot LoRA is used."}),
+                "sampler_id": ("STRING", {"default": "", "tooltip": "Optional identifier for targeted sampler cleanup/logging when multiple samplers exist."}),
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
@@ -261,12 +264,19 @@ class WanVideoSampler:
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, holocine_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, holocine_args=None, start_step=0, end_step=-1, add_noise_to_samples=False, sampler_cleanup="none", sampler_id=""):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
         patcher = model
         model = model.model
         transformer = model.diffusion_model
+        if sampler_id is None:
+            sampler_id = ""
+        if not sampler_id:
+            sampler_id = getattr(self, "_wanvideo_sampler_id", "")
+            if not sampler_id:
+                sampler_id = f"sampler_{id(self)}"
+                self._wanvideo_sampler_id = sampler_id
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
@@ -310,6 +320,23 @@ class WanVideoSampler:
             shot_lora_payload = prepare_shot_lora_payload(patcher.model, shot_lora_specs)
             if all(len(entry) == 0 for entry in shot_lora_payload):
                 shot_lora_payload = []
+
+        cleanup_mode = sampler_cleanup or "none"
+        if cleanup_mode not in ("none", "empty_cache", "empty_cache_if_shot_lora"):
+            cleanup_mode = "none"
+
+        def _maybe_sampler_cleanup(reason):
+            if cleanup_mode == "none":
+                return
+            if cleanup_mode == "empty_cache_if_shot_lora" and not shot_lora_payload:
+                return
+            tag = reason
+            if sampler_id:
+                tag = f"{sampler_id}:{reason}"
+            try:
+                cleanup_cuda_cache(tag=tag)
+            except Exception as exc:
+                log.warning(f"Sampler cleanup failed ({tag}): {exc}")
 
         block_swap_args = transformer_options.get("block_swap_args", None)
         if block_swap_args is not None:
@@ -2459,6 +2486,7 @@ class WanVideoSampler:
                         if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                             hard_offload_transformer(transformer)
                             _debug_shot_lora_state(transformer, "after_hard_offload")
+                        _maybe_sampler_cleanup("audio_sampling_end")
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2759,6 +2787,7 @@ class WanVideoSampler:
                         if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                             hard_offload_transformer(transformer)
                             _debug_shot_lora_state(transformer, "after_hard_offload")
+                        _maybe_sampler_cleanup("wananimate_sampling_end")
                         try:
                             print_memory(device)
                             torch.cuda.reset_peak_memory_stats(device)
@@ -2878,6 +2907,7 @@ class WanVideoSampler:
                 if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                     hard_offload_transformer(transformer)
                     _debug_shot_lora_state(transformer, "after_hard_offload_error")
+                _maybe_sampler_cleanup("sampling_error")
                 raise e
 
         if phantom_latents is not None:
@@ -2909,6 +2939,7 @@ class WanVideoSampler:
             hard_offload_transformer(transformer)
             _debug_shot_lora_state(transformer, "after_hard_offload")
 
+        _maybe_sampler_cleanup("sampling_end")
         try:
             print_memory(device)
             torch.cuda.reset_peak_memory_stats(device)
@@ -2972,6 +3003,8 @@ class WanVideoSamplerExtraArgs():
                 "fantasytalking_embeds": ("FANTASYTALKING_EMBEDS", ),
                 "uni3c_embeds": ("UNI3C_EMBEDS", ),
                 "multitalk_embeds": ("MULTITALK_EMBEDS", ),
+                "sampler_cleanup": (["none", "empty_cache", "empty_cache_if_shot_lora"], {"default": "none", "tooltip": "Optional: run CUDA cache cleanup after sampling. 'empty_cache_if_shot_lora' only triggers when per-shot LoRA is used."}),
+                "sampler_id": ("STRING", {"default": "", "tooltip": "Optional identifier for targeted sampler cleanup/logging when multiple samplers exist."}),
             }
         }
     RETURN_TYPES = ("WANVIDSAMPLEREXTRAARGS",)

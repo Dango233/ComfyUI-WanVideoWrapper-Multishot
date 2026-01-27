@@ -51,22 +51,39 @@ class MetaParameter(torch.nn.Parameter):
         self.quant_type = quant_type
         return self
 
+def _unwrap_module(module):
+    current = module
+    while True:
+        next_mod = None
+        for attr in ("_orig_mod", "module"):
+            candidate = getattr(current, attr, None)
+            if isinstance(candidate, torch.nn.Module):
+                next_mod = candidate
+                break
+        if next_mod is None or next_mod is current:
+            return current
+        current = next_mod
+
+
 def offload_transformer(transformer, remove_lora=True):
-    transformer.teacache_state.clear_all()
-    transformer.magcache_state.clear_all()
-    transformer.easycache_state.clear_all()
+    target = _unwrap_module(transformer)
+    for mod in {transformer, target}:
+        for attr in ("teacache_state", "magcache_state", "easycache_state"):
+            state = getattr(mod, attr, None)
+            if state is not None:
+                state.clear_all()
 
     # Always clear per-shot LoRA buffers (runtime-only) before offloading.
     try:
-        remove_shot_lora_from_module(transformer)
+        remove_shot_lora_from_module(target)
     except Exception as exc:
         log.warning(f"Failed to clear per-shot LoRA before offload: {exc}")
 
-    if transformer.patched_linear:
-        for name, param in transformer.named_parameters():
+    if getattr(target, "patched_linear", False):
+        for name, param in target.named_parameters():
             if "loras" in name or "controlnet" in name:
                 continue
-            module = transformer
+            module = target
             subnames = name.split('.')
             for subname in subnames[:-1]:
                 module = getattr(module, subname)
@@ -80,13 +97,13 @@ def offload_transformer(transformer, remove_lora=True):
             else:
                 pass
         if remove_lora:
-            remove_lora_from_module(transformer)
+            remove_lora_from_module(target)
     else:
-        transformer.to(offload_device)
+        target.to(offload_device)
 
-    for block in transformer.blocks:
+    for block in target.blocks:
         block.kv_cache = None
-        if transformer.audio_model is not None and hasattr(block, 'audio_block'):
+        if target.audio_model is not None and hasattr(block, 'audio_block'):
             block.audio_block = None
 
     mm.soft_empty_cache()
@@ -95,20 +112,23 @@ def offload_transformer(transformer, remove_lora=True):
 
 def hard_offload_transformer(transformer, remove_lora=True):
     """Force-release GPU memory even if the model stays referenced in node cache."""
-    transformer.teacache_state.clear_all()
-    transformer.magcache_state.clear_all()
-    transformer.easycache_state.clear_all()
+    target = _unwrap_module(transformer)
+    for mod in {transformer, target}:
+        for attr in ("teacache_state", "magcache_state", "easycache_state"):
+            state = getattr(mod, attr, None)
+            if state is not None:
+                state.clear_all()
 
     # Always clear per-shot LoRA buffers (runtime-only) before offloading.
     try:
-        remove_shot_lora_from_module(transformer)
+        remove_shot_lora_from_module(target)
     except Exception as exc:
         log.warning(f"Failed to clear per-shot LoRA before hard offload: {exc}")
 
-    for name, param in transformer.named_parameters():
+    for name, param in target.named_parameters():
         if "loras" in name or "controlnet" in name:
             continue
-        module = transformer
+        module = target
         subnames = name.split('.')
         for subname in subnames[:-1]:
             module = getattr(module, subname)
@@ -123,11 +143,11 @@ def hard_offload_transformer(transformer, remove_lora=True):
             pass
 
     if remove_lora:
-        remove_lora_from_module(transformer)
+        remove_lora_from_module(target)
 
-    for block in transformer.blocks:
+    for block in target.blocks:
         block.kv_cache = None
-        if transformer.audio_model is not None and hasattr(block, 'audio_block'):
+        if target.audio_model is not None and hasattr(block, 'audio_block'):
             block.audio_block = None
 
     mm.soft_empty_cache()
@@ -886,6 +906,37 @@ def _ensure_soft_empty_cache_hook():
 
     mm.soft_empty_cache = _wrapped_soft_empty_cache
     mm._wanvideo_soft_cache_hooked = True
+
+
+def cleanup_cuda_cache(tag=""):
+    """Run gc + soft_empty_cache with optional tagged debug output."""
+    mem_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_MEM")
+    stats_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
+    snapshot_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
+
+    before_mem = _cuda_mem_snapshot() if mem_debug else None
+    before_stats = snapshot_cuda_stats() if stats_debug else None
+    before_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    mm.soft_empty_cache()
+
+    after_mem = _cuda_mem_snapshot() if mem_debug else None
+    after_stats = snapshot_cuda_stats() if stats_debug else None
+    after_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
+
+    if not tag:
+        tag = "sampler_cleanup"
+    if mem_debug:
+        report_cuda_mem_delta(before_mem, after_mem, tag=tag)
+    if stats_debug:
+        report_cuda_stats_delta(before_stats, after_stats, tag=tag)
+    if snapshot_debug:
+        report_cuda_snapshot_delta(before_snapshot, after_snapshot, tag=tag)
+    return True
 
 
 if (
