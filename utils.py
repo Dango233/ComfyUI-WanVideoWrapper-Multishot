@@ -452,6 +452,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
         return None
 
     total_entries = 0
+    before_all = _cuda_mem_snapshot()
     for source_name, cache_obj in cache_sources:
         entries = _collect_cache_entry_handles(cache_obj)
         if not entries:
@@ -497,6 +498,9 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
                 f"(delta {-freed / (1024 ** 3):.3f} GB)"
             )
+    after_all = _cuda_mem_snapshot()
+    if before_all is not None and after_all is not None:
+        report_cuda_mem_delta(before_all, after_all, tag=f"{tag}_summary")
     log.info(f"[NodeCache] {tag} done entries={total_entries}")
     return True
 
