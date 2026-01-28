@@ -442,6 +442,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
         return None
     min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
     report_sizes = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_REPORT_SIZE")
+    delta_only = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DELTA")
     cache_sources = []
     for cache_name in ("outputs", "ui", "objects"):
         cache_obj = getattr(executor.caches, cache_name, None)
@@ -473,7 +474,6 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                         f"[NodeCache] {tag} {source_name} {key_text} "
                         f"cuda_bytes {bytes_now / (1024 ** 2):.2f} MB"
                     )
-            _cleanup_log(tag, f"{source_name} {key_text} delete start")
             before = _cuda_mem_snapshot()
             try:
                 del container[key]
@@ -483,27 +483,33 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 except Exception:
                     pass
             value = None
-            _cleanup_log(tag, f"{source_name} {key_text} delete done")
-            _cleanup_log(tag, f"{source_name} {key_text} gc.collect start")
             try:
                 gc.collect()
             except Exception:
                 pass
-            _cleanup_log(tag, f"{source_name} {key_text} gc.collect done")
-            _cleanup_log(tag, f"{source_name} {key_text} soft_empty_cache start")
             _soft_empty_cache_raw()
-            _cleanup_log(tag, f"{source_name} {key_text} soft_empty_cache done")
             after = _cuda_mem_snapshot()
 
             if before is None or after is None:
                 continue
-            freed = before["allocated"] - after["allocated"]
-            if freed < min_delta_mb * 1024 * 1024:
-                continue
+            alloc_delta = after["allocated"] - before["allocated"]
+            reserv_delta = after["reserved"] - before["reserved"]
+            if delta_only:
+                if (
+                    abs(alloc_delta) < min_delta_mb * 1024 * 1024
+                    and abs(reserv_delta) < min_delta_mb * 1024 * 1024
+                ):
+                    continue
+            else:
+                freed = before["allocated"] - after["allocated"]
+                if freed < min_delta_mb * 1024 * 1024:
+                    continue
             log.info(
                 f"[NodeCache] {tag} {source_name} {key_text} "
                 f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
-                f"(delta {-freed / (1024 ** 3):.3f} GB)"
+                f"(delta {alloc_delta / (1024 ** 3):.3f} GB) "
+                f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
+                f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
             )
     after_all = _cuda_mem_snapshot()
     if before_all is not None and after_all is not None:
