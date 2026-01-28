@@ -457,6 +457,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
         entries = _collect_cache_entry_handles(cache_obj)
         if not entries:
             continue
+        _cleanup_log(tag, f"{source_name} entries={len(entries)} start")
         total_entries += len(entries)
         for container, key, value, display_key in entries:
             key_text = display_key
@@ -472,6 +473,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                         f"[NodeCache] {tag} {source_name} {key_text} "
                         f"cuda_bytes {bytes_now / (1024 ** 2):.2f} MB"
                     )
+            _cleanup_log(tag, f"{source_name} {key_text} delete start")
             before = _cuda_mem_snapshot()
             try:
                 del container[key]
@@ -481,11 +483,16 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 except Exception:
                     pass
             value = None
+            _cleanup_log(tag, f"{source_name} {key_text} delete done")
+            _cleanup_log(tag, f"{source_name} {key_text} gc.collect start")
             try:
                 gc.collect()
             except Exception:
                 pass
+            _cleanup_log(tag, f"{source_name} {key_text} gc.collect done")
+            _cleanup_log(tag, f"{source_name} {key_text} soft_empty_cache start")
             _soft_empty_cache_raw()
+            _cleanup_log(tag, f"{source_name} {key_text} soft_empty_cache done")
             after = _cuda_mem_snapshot()
 
             if before is None or after is None:
@@ -523,6 +530,7 @@ def _ensure_prompt_executor_reset_hook(execution):
         snapshot_debug = _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
         evict_debug = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT")
 
+        _cleanup_log("prompt_executor_reset", "start")
         if evict_debug:
             _evict_node_cache_entries(self, tag="prompt_executor_reset_evict")
 
@@ -533,6 +541,7 @@ def _ensure_prompt_executor_reset_hook(execution):
         before_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
 
         result = original_reset(self, *args, **kwargs)
+        _cleanup_log("prompt_executor_reset", "original reset done")
 
         after_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         after_mem = _cuda_mem_snapshot() if mem_debug else None
@@ -550,6 +559,7 @@ def _ensure_prompt_executor_reset_hook(execution):
             report_cuda_stats_delta(before_stats, after_stats, tag="prompt_executor_reset")
         if snapshot_debug:
             report_cuda_snapshot_delta(before_snapshot, after_snapshot, tag="prompt_executor_reset")
+        _cleanup_log("prompt_executor_reset", "done")
         return result
 
     PromptExecutor.reset = _wrapped_reset
@@ -762,6 +772,16 @@ def report_cuda_mem_delta(before, after, tag="", min_delta_mb=32):
 
 def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in ("1", "true", "yes")
+
+
+def _cleanup_verbose_enabled() -> bool:
+    return _env_enabled("WANVIDEO_DEBUG_CLEANUP_VERBOSE")
+
+
+def _cleanup_log(tag: str, message: str):
+    if not _cleanup_verbose_enabled():
+        return
+    log.info(f"[Cleanup] {tag} {message}")
 
 
 def _get_min_delta_mb(default=64):
@@ -1008,12 +1028,20 @@ def _ensure_soft_empty_cache_hook():
         before_mem = _cuda_mem_snapshot() if mem_debug else None
         before_stats = snapshot_cuda_stats() if stats_debug else None
         before_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
+        if _cleanup_verbose_enabled():
+            snap = _cuda_mem_snapshot()
+            if snap is not None:
+                _cleanup_log("soft_empty_cache", f"before allocated={snap['allocated'] / (1024 ** 3):.3f} GB reserved={snap['reserved'] / (1024 ** 3):.3f} GB")
 
         result = original(*args, **kwargs)
 
         after_mem = _cuda_mem_snapshot() if mem_debug else None
         after_stats = snapshot_cuda_stats() if stats_debug else None
         after_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
+        if _cleanup_verbose_enabled():
+            snap = _cuda_mem_snapshot()
+            if snap is not None:
+                _cleanup_log("soft_empty_cache", f"after allocated={snap['allocated'] / (1024 ** 3):.3f} GB reserved={snap['reserved'] / (1024 ** 3):.3f} GB")
 
         if mem_debug:
             report_cuda_mem_delta(before_mem, after_mem, tag="soft_empty_cache")
@@ -1038,11 +1066,16 @@ def cleanup_cuda_cache(tag=""):
     before_stats = snapshot_cuda_stats() if stats_debug else None
     before_snapshot = snapshot_cuda_snapshot_summary() if snapshot_debug else None
 
+    _cleanup_log(tag or "sampler_cleanup", "gc.collect start")
     try:
         gc.collect()
-    except Exception:
-        pass
+    except Exception as exc:
+        _cleanup_log(tag or "sampler_cleanup", f"gc.collect error: {exc}")
+    _cleanup_log(tag or "sampler_cleanup", "gc.collect done")
+
+    _cleanup_log(tag or "sampler_cleanup", "soft_empty_cache start")
     mm.soft_empty_cache()
+    _cleanup_log(tag or "sampler_cleanup", "soft_empty_cache done")
 
     after_mem = _cuda_mem_snapshot() if mem_debug else None
     after_stats = snapshot_cuda_stats() if stats_debug else None
