@@ -972,9 +972,13 @@ def _format_cache_key(obj, max_len=240, max_depth=6):
     return text
 
 
-def _describe_cache_value(value, max_items=6):
+def _describe_cache_value(value, max_items=6, depth=0, max_depth=2, max_len=240):
     if value is None:
         return "None"
+    if depth == 0:
+        max_items = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_MAX_ITEMS", max_items)
+        max_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_DEPTH", max_depth)
+        max_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_LEN", max_len)
     try:
         vtype = type(value)
         name = f"{vtype.__module__}.{vtype.__name__}"
@@ -989,6 +993,13 @@ def _describe_cache_value(value, max_items=6):
     try:
         if isinstance(value, (list, tuple)):
             details.append(f"{type(value).__name__}[{len(value)}]")
+            if depth < max_depth:
+                item_descs = []
+                for idx, item in enumerate(list(value)[:max_items]):
+                    desc = _describe_cache_value(item, max_items=max_items, depth=depth + 1, max_depth=max_depth, max_len=max_len)
+                    item_descs.append(f"{idx}:{desc}")
+                if item_descs:
+                    details.append("items={" + "; ".join(item_descs) + "}")
     except Exception:
         pass
     try:
@@ -1024,7 +1035,10 @@ def _describe_cache_value(value, max_items=6):
             details.append(f"model_params_cuda_sample={on_cuda}/{params}")
     except Exception:
         pass
-    return " | ".join(details)
+    text = " | ".join(details)
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
 
 
 def snapshot_cuda_tensor_census():
