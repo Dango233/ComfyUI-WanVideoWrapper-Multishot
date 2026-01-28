@@ -447,6 +447,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     decode_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE")
     probe_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE")
     probe_cuda = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA")
+    probe_cuda_deep = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_DEEP")
     decode_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_DEPTH", 6)
     decode_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_LEN", 240)
     logfile = _get_env_str("WANVIDEO_DEBUG_NODECACHE_EVICT_LOGFILE")
@@ -455,6 +456,10 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     probe_cuda_items = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_ITEMS", 4)
     probe_cuda_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_DEPTH", 4)
     probe_cuda_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_LEN", 240)
+    probe_cuda_deep_items = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_DEEP_ITEMS", 4)
+    probe_cuda_deep_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_DEEP_DEPTH", 3)
+    probe_cuda_deep_limit = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_DEEP_LIMIT", 6)
+    probe_cuda_deep_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE_CUDA_DEEP_LEN", 240)
     topn_min_mb = _get_env_float("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN_MIN_MB", 1.0)
     topn_limit = _get_max_items(default=10) if topn_enabled else 0
     cache_sources = []
@@ -505,6 +510,20 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                         cuda_text = None
                     if cuda_text:
                         probe_text = f"{probe_text} | {cuda_text}"
+                if probe_text and probe_cuda_deep:
+                    try:
+                        deep_text = _summarize_cuda_holders(
+                            value,
+                            max_items=probe_cuda_deep_items,
+                            bytes_depth=probe_cuda_depth,
+                            max_depth=probe_cuda_deep_depth,
+                            limit=probe_cuda_deep_limit,
+                            max_len=probe_cuda_deep_len,
+                        )
+                    except Exception:
+                        deep_text = None
+                    if deep_text:
+                        probe_text = f"{probe_text} | {deep_text}"
             if report_sizes:
                 try:
                     bytes_now = _cuda_tensor_bytes(value, set(), 0, 6)
@@ -1072,6 +1091,61 @@ def _summarize_cuda_children(value, max_items=4, bytes_depth=4, max_len=240):
     if not summaries:
         return None
     text = "cuda_children={" + "; ".join(summaries) + "}"
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def _collect_cuda_holders(obj, path, depth, max_depth, bytes_depth, max_items, seen, results):
+    obj_id = id(obj)
+    if obj_id in seen:
+        return
+    seen.add(obj_id)
+    try:
+        bytes_now = _cuda_tensor_bytes(obj, set(), 0, bytes_depth)
+    except Exception:
+        bytes_now = 0
+    if bytes_now > 0:
+        try:
+            tname = type(obj).__name__
+        except Exception:
+            tname = "unknown"
+        results.append((bytes_now, path, tname))
+    if depth >= max_depth:
+        return
+    try:
+        if isinstance(obj, dict):
+            for key, value in list(obj.items())[:max_items]:
+                _collect_cuda_holders(value, f"{path}.{key}", depth + 1, max_depth, bytes_depth, max_items, seen, results)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for idx, value in enumerate(list(obj)[:max_items]):
+                _collect_cuda_holders(value, f"{path}[{idx}]", depth + 1, max_depth, bytes_depth, max_items, seen, results)
+            return
+    except Exception:
+        return
+    try:
+        if hasattr(obj, "__dict__"):
+            _collect_cuda_holders(vars(obj), f"{path}.__dict__", depth + 1, max_depth, bytes_depth, max_items, seen, results)
+    except Exception:
+        return
+
+
+def _summarize_cuda_holders(value, max_items=4, bytes_depth=4, max_depth=3, limit=6, max_len=240):
+    if value is None:
+        return None
+    results = []
+    try:
+        _collect_cuda_holders(value, "root", 0, max_depth, bytes_depth, max_items, set(), results)
+    except Exception:
+        return None
+    if not results:
+        return None
+    results.sort(key=lambda it: it[0], reverse=True)
+    parts = []
+    for bytes_now, path, tname in results[:limit]:
+        parts.append(f"{path}:{tname} {bytes_now / (1024 ** 2):.2f}MB")
+    text = "cuda_holders={" + "; ".join(parts) + "}"
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
     return text
