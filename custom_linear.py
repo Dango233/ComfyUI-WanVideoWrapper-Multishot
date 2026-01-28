@@ -149,7 +149,6 @@ class CustomLinear(nn.Linear):
         self.shot_lora = []
         self.shot_lora_key = None
         self._shot_lora_buffer_names = []
-        self._shot_lora_gpu_cache = {}
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -166,8 +165,6 @@ class CustomLinear(nn.Linear):
                 if hasattr(self, name):
                     delattr(self, name)
             self._shot_lora_buffer_names = []
-        if hasattr(self, "_shot_lora_gpu_cache"):
-            self._shot_lora_gpu_cache.clear()
         self.shot_lora = []
         self.shot_lora_key = None
 
@@ -305,7 +302,7 @@ class CustomLinear(nn.Linear):
         device = flat_input.device
         dtype = flat_input.dtype
         current_step = ctx.get("current_step", 0)
-        gpu_cache = self._shot_lora_gpu_cache
+        gpu_cache = ctx.setdefault("shot_lora_gpu_cache", {})
 
         def _resolve_shot_tensor(value, cache_key):
             if isinstance(value, str):
