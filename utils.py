@@ -665,6 +665,17 @@ def _ensure_prompt_executor_reset_hook(execution):
 
         result = original_reset(self, *args, **kwargs)
         _cleanup_log("prompt_executor_reset", "original reset done")
+        try:
+            caches = getattr(self, "caches", None)
+            if caches is not None:
+                if hasattr(caches, "outputs"):
+                    setattr(caches.outputs, "_wanvideo_cache_kind", "outputs")
+                if hasattr(caches, "ui"):
+                    setattr(caches.ui, "_wanvideo_cache_kind", "ui")
+                if hasattr(caches, "objects"):
+                    setattr(caches.objects, "_wanvideo_cache_kind", "objects")
+        except Exception:
+            pass
 
         after_cache = _snapshot_node_cache_for_executor(self) if node_debug else None
         after_mem = _cuda_mem_snapshot() if mem_debug else None
@@ -952,6 +963,55 @@ def _get_env_str(name: str, default: str | None = None):
     if raw is None:
         return default
     return raw
+
+
+def _should_skip_output_cache(cache_obj, node_id, value):
+    try:
+        dynprompt = getattr(cache_obj, "dynprompt", None)
+        if dynprompt is None or not dynprompt.has_node(node_id):
+            return False
+        node = dynprompt.get_node(node_id)
+        class_type = node.get("class_type")
+        if not class_type:
+            return False
+        try:
+            import nodes as _nodes
+        except Exception:
+            return False
+        class_def = _nodes.NODE_CLASS_MAPPINGS.get(class_type)
+        if class_def is None:
+            return False
+        if getattr(class_def, "NO_OUTPUT_CACHE", False):
+            return True
+        if getattr(class_def, "WANVIDEO_NO_OUTPUT_CACHE", False):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _ensure_output_cache_skip_hook():
+    try:
+        import comfy_execution.caching as _caching
+    except Exception:
+        return
+    if getattr(_caching, "_wanvideo_skip_output_cache_hooked", False):
+        return
+    original_set = getattr(_caching.BasicCache, "_set_immediate", None)
+    if original_set is None:
+        return
+
+    def _wrapped_set_immediate(self, node_id, value):
+        try:
+            if getattr(self, "_wanvideo_cache_kind", None) == "outputs":
+                if _should_skip_output_cache(self, node_id, value):
+                    return None
+        except Exception:
+            pass
+        return original_set(self, node_id, value)
+
+    _caching.BasicCache._set_immediate = _wrapped_set_immediate
+    _caching._wanvideo_skip_output_cache_hooked = True
 
 
 def _append_debug_file(path: str, line: str):
@@ -1439,15 +1499,16 @@ def cleanup_cuda_cache(tag=""):
     return True
 
 
-if (
-    _env_enabled("WANVIDEO_DEBUG_NODECACHE")
-    or _env_enabled("WANVIDEO_DEBUG_CUDA_MEM")
-    or _env_enabled("WANVIDEO_DEBUG_CUDA_CENSUS")
-    or _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
-    or _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
-):
-    _exec_mod = _get_execution_module()
-    if _exec_mod is not None:
+_exec_mod = _get_execution_module()
+if _exec_mod is not None:
+    _ensure_output_cache_skip_hook()
+    if (
+        _env_enabled("WANVIDEO_DEBUG_NODECACHE")
+        or _env_enabled("WANVIDEO_DEBUG_CUDA_MEM")
+        or _env_enabled("WANVIDEO_DEBUG_CUDA_CENSUS")
+        or _env_enabled("WANVIDEO_DEBUG_CUDA_STATS")
+        or _env_enabled("WANVIDEO_DEBUG_CUDA_SNAPSHOT")
+    ):
         _ensure_execution_hook(_exec_mod)
         _ensure_prompt_executor_reset_hook(_exec_mod)
     _ensure_soft_empty_cache_hook()

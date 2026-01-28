@@ -728,6 +728,7 @@ def load_lora_for_models_mod(model, lora, strength_model):
     return (new_modelpatcher)
 
 class WanVideoSetLoRAs:
+    NO_OUTPUT_CACHE = True
     @classmethod
     def INPUT_TYPES(s):
         return {
