@@ -51,7 +51,11 @@ def offload_model_sd_to_cpu(patcher):
         return
     moved = False
     for key, value in sd.items():
-        if isinstance(value, torch.Tensor) and value.device.type != "cpu":
+        if not isinstance(value, torch.Tensor):
+            continue
+        if value.is_meta or value.device.type == "meta":
+            continue
+        if value.device.type != "cpu":
             sd[key] = value.to("cpu")
             moved = True
     if moved:
