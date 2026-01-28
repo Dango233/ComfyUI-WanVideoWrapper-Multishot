@@ -340,15 +340,15 @@ def _collect_cache_entries(cache_obj):
 
 
 def _collect_cache_entry_handles(cache_obj):
-    """Return list of (container_dict, key, value, display_key) for cache entries."""
+    """Return list of (container_dict, key, display_key) for cache entries."""
     entries = []
     if cache_obj is None:
         return entries
 
     if hasattr(cache_obj, "cache") and isinstance(cache_obj.cache, dict):
         def _walk(cache, prefix=""):
-            for key, value in list(cache.cache.items()):
-                entries.append((cache.cache, key, value, f"{prefix}{repr(key)}"))
+            for key in list(cache.cache.keys()):
+                entries.append((cache.cache, key, f"{prefix}{repr(key)}"))
             subcaches = getattr(cache, "subcaches", None)
             if isinstance(subcaches, dict):
                 for subkey, subcache in list(subcaches.items()):
@@ -357,16 +357,16 @@ def _collect_cache_entry_handles(cache_obj):
         return entries
 
     if isinstance(cache_obj, dict):
-        for key, value in list(cache_obj.items()):
-            entries.append((cache_obj, key, value, repr(key)))
+        for key in list(cache_obj.keys()):
+            entries.append((cache_obj, key, repr(key)))
         return entries
 
     for attr in ("cache", "node_cache", "NODE_CACHE"):
         if hasattr(cache_obj, attr):
             val = getattr(cache_obj, attr)
             if isinstance(val, dict):
-                for key, value in list(val.items()):
-                    entries.append((val, key, value, repr(key)))
+                for key in list(val.keys()):
+                    entries.append((val, key, repr(key)))
                 return entries
     return entries
 
@@ -464,10 +464,18 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
             continue
         _cleanup_log(tag, f"{source_name} entries={len(entries)} start")
         total_entries += len(entries)
-        for container, key, value, display_key in entries:
+        for container, key, display_key in entries:
             key_text = display_key
             if len(key_text) > 160:
                 key_text = key_text[:157] + "..."
+            value = None
+            try:
+                if hasattr(container, "get"):
+                    value = container.get(key, None)
+                else:
+                    value = container[key]
+            except Exception:
+                value = None
             if report_sizes:
                 try:
                     bytes_now = _cuda_tensor_bytes(value, set(), 0, 6)
