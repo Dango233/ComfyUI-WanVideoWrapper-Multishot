@@ -487,7 +487,6 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 gc.collect()
             except Exception:
                 pass
-            _soft_empty_cache_raw()
             after = _cuda_mem_snapshot()
 
             if before is None or after is None:
@@ -511,7 +510,17 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
                 f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
             )
-    after_all = _cuda_mem_snapshot()
+    after_entries = _cuda_mem_snapshot()
+    if before_all is not None and after_entries is not None:
+        report_cuda_mem_delta(before_all, after_entries, tag=f"{tag}_entries")
+
+    before_flush = _cuda_mem_snapshot()
+    _soft_empty_cache_raw()
+    after_flush = _cuda_mem_snapshot()
+    if before_flush is not None and after_flush is not None:
+        report_cuda_mem_delta(before_flush, after_flush, tag=f"{tag}_allocator_flush")
+
+    after_all = after_flush or after_entries
     if before_all is not None and after_all is not None:
         report_cuda_mem_delta(before_all, after_all, tag=f"{tag}_summary")
     log.info(f"[NodeCache] {tag} done entries={total_entries}")
