@@ -525,7 +525,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
             reserv_delta = after["reserved"] - before["reserved"]
             freed_mb = (before["allocated"] - after["allocated"]) / (1024 ** 2)
             if freed_mb > 0:
-                evict_deltas.append((freed_mb, alloc_delta, reserv_delta, source_name, key, key_text))
+                evict_deltas.append((freed_mb, alloc_delta, reserv_delta, source_name, key, key_text, probe_text))
             if delta_only:
                 if (
                     abs(alloc_delta) < min_delta_mb * 1024 * 1024
@@ -560,7 +560,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     if topn_limit and evict_deltas:
         evict_deltas.sort(key=lambda item: item[0], reverse=True)
         shown = 0
-        for freed_mb, alloc_delta, reserv_delta, source_name, key_obj, key_text in evict_deltas:
+        for freed_mb, alloc_delta, reserv_delta, source_name, key_obj, key_text, saved_probe in evict_deltas:
             if freed_mb < topn_min_mb:
                 continue
             if not decode_enabled:
@@ -571,13 +571,8 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
                 f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
             )
-            if probe_enabled:
-                try:
-                    probe_text = _describe_cache_value(container.get(key_obj) if hasattr(container, "get") else None)
-                except Exception:
-                    probe_text = None
-                if probe_text:
-                    line = f"{line} probe={probe_text}"
+            if probe_enabled and saved_probe:
+                line = f"{line} probe={saved_probe}"
             log.info(line)
             if logfile:
                 file_key_text = _format_cache_key(key_obj, max_len=logfile_len, max_depth=logfile_depth)
@@ -587,13 +582,8 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                     f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
                     f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
                 )
-                if probe_enabled:
-                    try:
-                        probe_text = _describe_cache_value(container.get(key_obj) if hasattr(container, "get") else None)
-                    except Exception:
-                        probe_text = None
-                    if probe_text:
-                        file_line = f"{file_line} probe={probe_text}"
+                if probe_enabled and saved_probe:
+                    file_line = f"{file_line} probe={saved_probe}"
                 _append_debug_file(logfile, file_line)
             shown += 1
             if shown >= topn_limit:
