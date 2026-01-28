@@ -36,7 +36,17 @@ PATCH_SIZE = (1, 2, 2)
 
 
 def offload_model_sd_to_cpu(patcher):
-    sd = patcher.model.get("sd")
+    model_obj = getattr(patcher, "model", None)
+    sd = None
+    if isinstance(model_obj, dict):
+        sd = model_obj.get("sd")
+    elif hasattr(model_obj, "pipeline") and isinstance(model_obj.pipeline, dict):
+        sd = model_obj.pipeline.get("sd")
+    else:
+        try:
+            sd = model_obj["sd"]
+        except Exception:
+            sd = None
     if not isinstance(sd, dict):
         return
     moved = False
