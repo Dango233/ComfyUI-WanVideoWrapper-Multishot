@@ -35,6 +35,20 @@ VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
 
+def offload_model_sd_to_cpu(patcher):
+    sd = patcher.model.get("sd")
+    if not isinstance(sd, dict):
+        return
+    moved = False
+    for key, value in sd.items():
+        if isinstance(value, torch.Tensor) and value.device.type != "cpu":
+            sd[key] = value.to("cpu")
+            moved = True
+    if moved:
+        mm.soft_empty_cache()
+        gc.collect()
+
+
 def prepare_shot_lora_payload(base_model, shot_lora_specs):
     """Load and organize per-shot LoRA adapters for Holocine workflows."""
     if not shot_lora_specs:
@@ -2833,6 +2847,8 @@ class WanVideoSampler:
                 assign_shot_lora_to_transformer(transformer, [])
                 if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
                     hard_offload_transformer(transformer)
+                if force_offload:
+                    offload_model_sd_to_cpu(patcher)
                 raise e
 
         if phantom_latents is not None:
@@ -2861,6 +2877,8 @@ class WanVideoSampler:
         assign_shot_lora_to_transformer(transformer, [])
         if force_offload and (not model["auto_cpu_offload"] or shot_lora_payload):
             hard_offload_transformer(transformer)
+        if force_offload:
+            offload_model_sd_to_cpu(patcher)
 
         try:
             print_memory(device)
