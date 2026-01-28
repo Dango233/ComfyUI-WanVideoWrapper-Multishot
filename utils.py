@@ -444,6 +444,9 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     report_sizes = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_REPORT_SIZE")
     delta_only = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DELTA")
     topn_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN")
+    decode_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE")
+    decode_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_DEPTH", 6)
+    decode_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_LEN", 240)
     topn_min_mb = _get_env_float("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN_MIN_MB", 1.0)
     topn_limit = _get_max_items(default=10) if topn_enabled else 0
     cache_sources = []
@@ -468,6 +471,8 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
             key_text = display_key
             if len(key_text) > 160:
                 key_text = key_text[:157] + "..."
+            if decode_enabled:
+                key_text = _format_cache_key(key, max_len=decode_len, max_depth=decode_depth)
             value = None
             try:
                 if hasattr(container, "get"):
@@ -507,7 +512,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
             reserv_delta = after["reserved"] - before["reserved"]
             freed_mb = (before["allocated"] - after["allocated"]) / (1024 ** 2)
             if freed_mb > 0:
-                evict_deltas.append((freed_mb, alloc_delta, reserv_delta, source_name, key_text))
+                evict_deltas.append((freed_mb, alloc_delta, reserv_delta, source_name, key, key_text))
             if delta_only:
                 if (
                     abs(alloc_delta) < min_delta_mb * 1024 * 1024
@@ -528,9 +533,11 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     if topn_limit and evict_deltas:
         evict_deltas.sort(key=lambda item: item[0], reverse=True)
         shown = 0
-        for freed_mb, alloc_delta, reserv_delta, source_name, key_text in evict_deltas:
+        for freed_mb, alloc_delta, reserv_delta, source_name, key_obj, key_text in evict_deltas:
             if freed_mb < topn_min_mb:
                 continue
+            if not decode_enabled:
+                key_text = _format_cache_key(key_obj, max_len=decode_len, max_depth=decode_depth)
             log.info(
                 f"[NodeCache] {tag}_top {source_name} {key_text} "
                 f"freed {freed_mb:.2f} MB "
@@ -857,6 +864,55 @@ def _get_env_float(name: str, default: float):
         return float(raw)
     except Exception:
         return default
+
+
+def _get_env_int(name: str, default: int):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _decode_cache_key(obj, depth=0, max_depth=6):
+    if depth >= max_depth:
+        return "<max_depth>"
+    if isinstance(obj, frozenset):
+        items = list(obj)
+        if items and all(isinstance(it, tuple) and len(it) == 2 for it in items):
+            try:
+                items = sorted(items, key=lambda it: it[0])
+            except Exception:
+                pass
+            decoded = []
+            for k, v in items:
+                decoded.append((_decode_cache_key(k, depth + 1, max_depth), _decode_cache_key(v, depth + 1, max_depth)))
+            return decoded
+        return [_decode_cache_key(it, depth + 1, max_depth) for it in items]
+    if isinstance(obj, tuple):
+        return tuple(_decode_cache_key(it, depth + 1, max_depth) for it in obj)
+    if isinstance(obj, list):
+        return [_decode_cache_key(it, depth + 1, max_depth) for it in obj]
+    if isinstance(obj, dict):
+        decoded = []
+        for k, v in obj.items():
+            decoded.append((_decode_cache_key(k, depth + 1, max_depth), _decode_cache_key(v, depth + 1, max_depth)))
+        return decoded
+    return obj
+
+
+def _format_cache_key(obj, max_len=240, max_depth=6):
+    try:
+        decoded = _decode_cache_key(obj, 0, max_depth)
+        text = repr(decoded)
+    except Exception:
+        text = repr(obj)
+    text = text.replace("\n", " ")
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
 
 
 def snapshot_cuda_tensor_census():
