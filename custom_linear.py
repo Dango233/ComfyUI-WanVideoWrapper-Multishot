@@ -302,23 +302,17 @@ class CustomLinear(nn.Linear):
         device = flat_input.device
         dtype = flat_input.dtype
         current_step = ctx.get("current_step", 0)
-        gpu_cache = ctx.setdefault("shot_lora_gpu_cache", {})
 
-        def _resolve_shot_tensor(value, cache_key):
+        def _resolve_shot_tensor(value):
             if isinstance(value, str):
                 if hasattr(self, value):
                     value = getattr(self, value)
                 else:
                     return None
             if isinstance(value, torch.Tensor):
-                if value.device == device and value.dtype == dtype:
-                    return value
-                cached = gpu_cache.get(cache_key)
-                if cached is not None and cached.device == device and cached.dtype == dtype:
-                    return cached
-                cached = value.to(device=device, dtype=dtype, non_blocking=True)
-                gpu_cache[cache_key] = cached
-                return cached
+                if value.device != device or value.dtype != dtype:
+                    value = value.to(device=device, dtype=dtype, non_blocking=True)
+                return value
             return None
 
         for shot_idx, components in enumerate(self.shot_lora):
@@ -332,7 +326,7 @@ class CustomLinear(nn.Linear):
                 continue
             shot_input = flat_input.index_select(0, indices)
             shot_delta = None
-            for comp_idx, component in enumerate(components):
+            for component in components:
                 if not isinstance(component, dict):
                     continue
 
@@ -348,10 +342,7 @@ class CustomLinear(nn.Linear):
 
                 diff_weight = component.get("diff")
                 if diff_weight is not None:
-                    diff_weight = _resolve_shot_tensor(
-                        diff_weight,
-                        (id(self), shot_idx, comp_idx, "diff", device, dtype),
-                    )
+                    diff_weight = _resolve_shot_tensor(diff_weight)
                     if diff_weight is None:
                         continue
                     if diff_weight.ndim != 2:
@@ -371,14 +362,8 @@ class CustomLinear(nn.Linear):
 
                 up_weight = component.get("up")
                 down_weight = component.get("down")
-                up_weight = _resolve_shot_tensor(
-                    up_weight,
-                    (id(self), shot_idx, comp_idx, "up", device, dtype),
-                )
-                down_weight = _resolve_shot_tensor(
-                    down_weight,
-                    (id(self), shot_idx, comp_idx, "down", device, dtype),
-                )
+                up_weight = _resolve_shot_tensor(up_weight)
+                down_weight = _resolve_shot_tensor(down_weight)
                 if up_weight is None or down_weight is None:
                     continue
 
@@ -467,7 +452,9 @@ def set_shot_lora_params(module, shot_payload, module_prefix="", device=torch.de
             module.shot_lora = []
             module.shot_lora_key = key
         else:
+            buffer_names = []
             processed = []
+            dtype = module.compute_dtype if module.compute_dtype is not None else None
             for shot_idx, components in enumerate(shot_components):
                 if not components:
                     processed.append([])
@@ -486,24 +473,26 @@ def set_shot_lora_params(module, shot_payload, module_prefix="", device=torch.de
 
                     diff_weight = component.get("diff")
                     if isinstance(diff_weight, torch.Tensor):
-                        if diff_weight.device.type != "cpu":
-                            diff_weight = diff_weight.detach().cpu()
-                        new_comp["diff"] = diff_weight.contiguous()
+                        name = f"_shot_lora_{shot_idx}_{comp_idx}_diff"
+                        module.register_buffer(name, diff_weight.to(device=device, dtype=dtype), persistent=False)
+                        buffer_names.append(name)
+                        new_comp["diff"] = name
 
                     up_weight = component.get("up")
                     down_weight = component.get("down")
                     if isinstance(up_weight, torch.Tensor) and isinstance(down_weight, torch.Tensor):
-                        if up_weight.device.type != "cpu":
-                            up_weight = up_weight.detach().cpu()
-                        if down_weight.device.type != "cpu":
-                            down_weight = down_weight.detach().cpu()
-                        new_comp["up"] = up_weight.contiguous()
-                        new_comp["down"] = down_weight.contiguous()
+                        up_name = f"_shot_lora_{shot_idx}_{comp_idx}_up"
+                        down_name = f"_shot_lora_{shot_idx}_{comp_idx}_down"
+                        module.register_buffer(up_name, up_weight.to(device=device, dtype=dtype), persistent=False)
+                        module.register_buffer(down_name, down_weight.to(device=device, dtype=dtype), persistent=False)
+                        buffer_names.extend([up_name, down_name])
+                        new_comp["up"] = up_name
+                        new_comp["down"] = down_name
 
                     if new_comp:
                         shot_list.append(new_comp)
                 processed.append(shot_list)
 
-            module._shot_lora_buffer_names = []
+            module._shot_lora_buffer_names = buffer_names
             module.shot_lora = processed
             module.shot_lora_key = key
