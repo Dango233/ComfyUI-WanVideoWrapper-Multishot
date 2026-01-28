@@ -443,6 +443,9 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     min_delta_mb = _get_min_delta_mb(default=min_delta_mb)
     report_sizes = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_REPORT_SIZE")
     delta_only = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DELTA")
+    topn_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN")
+    topn_min_mb = _get_env_float("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN_MIN_MB", 1.0)
+    topn_limit = _get_max_items(default=10) if topn_enabled else 0
     cache_sources = []
     for cache_name in ("outputs", "ui", "objects"):
         cache_obj = getattr(executor.caches, cache_name, None)
@@ -453,6 +456,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
         return None
 
     total_entries = 0
+    evict_deltas = []
     before_all = _cuda_mem_snapshot()
     for source_name, cache_obj in cache_sources:
         entries = _collect_cache_entry_handles(cache_obj)
@@ -493,6 +497,9 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 continue
             alloc_delta = after["allocated"] - before["allocated"]
             reserv_delta = after["reserved"] - before["reserved"]
+            freed_mb = (before["allocated"] - after["allocated"]) / (1024 ** 2)
+            if freed_mb > 0:
+                evict_deltas.append((freed_mb, alloc_delta, reserv_delta, source_name, key_text))
             if delta_only:
                 if (
                     abs(alloc_delta) < min_delta_mb * 1024 * 1024
@@ -510,6 +517,21 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
                 f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
             )
+    if topn_limit and evict_deltas:
+        evict_deltas.sort(key=lambda item: item[0], reverse=True)
+        shown = 0
+        for freed_mb, alloc_delta, reserv_delta, source_name, key_text in evict_deltas:
+            if freed_mb < topn_min_mb:
+                continue
+            log.info(
+                f"[NodeCache] {tag}_top {source_name} {key_text} "
+                f"freed {freed_mb:.2f} MB "
+                f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
+                f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
+            )
+            shown += 1
+            if shown >= topn_limit:
+                break
     after_entries = _cuda_mem_snapshot()
     if before_all is not None and after_entries is not None:
         report_cuda_mem_delta(before_all, after_entries, tag=f"{tag}_entries")
@@ -815,6 +837,16 @@ def _get_max_items(default=20):
         return default
     try:
         return max(1, int(raw))
+    except Exception:
+        return default
+
+
+def _get_env_float(name: str, default: float):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
     except Exception:
         return default
 
