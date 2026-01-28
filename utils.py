@@ -445,6 +445,7 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     delta_only = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DELTA")
     topn_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN")
     decode_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE")
+    probe_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_PROBE")
     decode_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_DEPTH", 6)
     decode_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_LEN", 240)
     logfile = _get_env_str("WANVIDEO_DEBUG_NODECACHE_EVICT_LOGFILE")
@@ -487,6 +488,12 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                     value = container[key]
             except Exception:
                 value = None
+            probe_text = None
+            if probe_enabled:
+                try:
+                    probe_text = _describe_cache_value(value)
+                except Exception:
+                    probe_text = "probe_error"
             if report_sizes:
                 try:
                     bytes_now = _cuda_tensor_bytes(value, set(), 0, 6)
@@ -536,6 +543,8 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
                 f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
             )
+            if probe_text:
+                line = f"{line} probe={probe_text}"
             log.info(line)
             if logfile and file_key_text:
                 file_line = (
@@ -545,6 +554,8 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                     f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
                     f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
                 )
+                if probe_text:
+                    file_line = f"{file_line} probe={probe_text}"
                 _append_debug_file(logfile, file_line)
     if topn_limit and evict_deltas:
         evict_deltas.sort(key=lambda item: item[0], reverse=True)
@@ -560,6 +571,13 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
                 f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
             )
+            if probe_enabled:
+                try:
+                    probe_text = _describe_cache_value(container.get(key_obj) if hasattr(container, "get") else None)
+                except Exception:
+                    probe_text = None
+                if probe_text:
+                    line = f"{line} probe={probe_text}"
             log.info(line)
             if logfile:
                 file_key_text = _format_cache_key(key_obj, max_len=logfile_len, max_depth=logfile_depth)
@@ -569,6 +587,13 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                     f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
                     f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
                 )
+                if probe_enabled:
+                    try:
+                        probe_text = _describe_cache_value(container.get(key_obj) if hasattr(container, "get") else None)
+                    except Exception:
+                        probe_text = None
+                    if probe_text:
+                        file_line = f"{file_line} probe={probe_text}"
                 _append_debug_file(logfile, file_line)
             shown += 1
             if shown >= topn_limit:
@@ -955,6 +980,61 @@ def _format_cache_key(obj, max_len=240, max_depth=6):
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
     return text
+
+
+def _describe_cache_value(value, max_items=6):
+    if value is None:
+        return "None"
+    try:
+        vtype = type(value)
+        name = f"{vtype.__module__}.{vtype.__name__}"
+    except Exception:
+        name = "unknown"
+    details = [name]
+    try:
+        if torch.is_tensor(value):
+            details.append(f"tensor {tuple(value.shape)} {str(value.dtype)} {str(value.device)}")
+    except Exception:
+        pass
+    try:
+        if isinstance(value, (list, tuple)):
+            details.append(f"{type(value).__name__}[{len(value)}]")
+    except Exception:
+        pass
+    try:
+        if isinstance(value, dict):
+            details.append(f"dict[{len(value)}]")
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "model"):
+            details.append("has_model")
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "model_patcher"):
+            details.append("has_model_patcher")
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "model") and torch.is_tensor(value.model):
+            details.append("model_tensor")
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "model") and hasattr(value.model, "parameters"):
+            params = 0
+            on_cuda = 0
+            for i, p in enumerate(value.model.parameters()):
+                if i >= max_items:
+                    break
+                params += 1
+                if getattr(p, "is_cuda", False):
+                    on_cuda += 1
+            details.append(f"model_params_cuda_sample={on_cuda}/{params}")
+    except Exception:
+        pass
+    return " | ".join(details)
 
 
 def snapshot_cuda_tensor_census():
