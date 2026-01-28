@@ -447,6 +447,9 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
     decode_enabled = _env_enabled("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE")
     decode_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_DEPTH", 6)
     decode_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_DECODE_LEN", 240)
+    logfile = _get_env_str("WANVIDEO_DEBUG_NODECACHE_EVICT_LOGFILE")
+    logfile_len = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_LOGFILE_LEN", 4096)
+    logfile_depth = _get_env_int("WANVIDEO_DEBUG_NODECACHE_EVICT_LOGFILE_DEPTH", decode_depth)
     topn_min_mb = _get_env_float("WANVIDEO_DEBUG_NODECACHE_EVICT_TOPN_MIN_MB", 1.0)
     topn_limit = _get_max_items(default=10) if topn_enabled else 0
     cache_sources = []
@@ -473,6 +476,9 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 key_text = key_text[:157] + "..."
             if decode_enabled:
                 key_text = _format_cache_key(key, max_len=decode_len, max_depth=decode_depth)
+            file_key_text = None
+            if logfile:
+                file_key_text = _format_cache_key(key, max_len=logfile_len, max_depth=logfile_depth)
             value = None
             try:
                 if hasattr(container, "get"):
@@ -523,13 +529,23 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 freed = before["allocated"] - after["allocated"]
                 if freed < min_delta_mb * 1024 * 1024:
                     continue
-            log.info(
+            line = (
                 f"[NodeCache] {tag} {source_name} {key_text} "
                 f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
                 f"(delta {alloc_delta / (1024 ** 3):.3f} GB) "
                 f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
                 f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
             )
+            log.info(line)
+            if logfile and file_key_text:
+                file_line = (
+                    f"[NodeCache] {tag} {source_name} {file_key_text} "
+                    f"allocated {before['allocated'] / (1024 ** 3):.3f} GB -> {after['allocated'] / (1024 ** 3):.3f} GB "
+                    f"(delta {alloc_delta / (1024 ** 3):.3f} GB) "
+                    f"reserved {before['reserved'] / (1024 ** 3):.3f} GB -> {after['reserved'] / (1024 ** 3):.3f} GB "
+                    f"(delta {reserv_delta / (1024 ** 3):.3f} GB)"
+                )
+                _append_debug_file(logfile, file_line)
     if topn_limit and evict_deltas:
         evict_deltas.sort(key=lambda item: item[0], reverse=True)
         shown = 0
@@ -538,12 +554,22 @@ def _evict_node_cache_entries(executor, tag="", min_delta_mb=64):
                 continue
             if not decode_enabled:
                 key_text = _format_cache_key(key_obj, max_len=decode_len, max_depth=decode_depth)
-            log.info(
+            line = (
                 f"[NodeCache] {tag}_top {source_name} {key_text} "
                 f"freed {freed_mb:.2f} MB "
                 f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
                 f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
             )
+            log.info(line)
+            if logfile:
+                file_key_text = _format_cache_key(key_obj, max_len=logfile_len, max_depth=logfile_depth)
+                file_line = (
+                    f"[NodeCache] {tag}_top {source_name} {file_key_text} "
+                    f"freed {freed_mb:.2f} MB "
+                    f"alloc_delta {alloc_delta / (1024 ** 3):.3f} GB "
+                    f"reserv_delta {reserv_delta / (1024 ** 3):.3f} GB"
+                )
+                _append_debug_file(logfile, file_line)
             shown += 1
             if shown >= topn_limit:
                 break
@@ -874,6 +900,22 @@ def _get_env_int(name: str, default: int):
         return int(raw)
     except Exception:
         return default
+
+
+def _get_env_str(name: str, default: str | None = None):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw
+
+
+def _append_debug_file(path: str, line: str):
+    try:
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line)
+            f.write("\n")
+    except Exception:
+        pass
 
 
 def _decode_cache_key(obj, depth=0, max_depth=6):
